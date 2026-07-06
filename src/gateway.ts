@@ -51,6 +51,50 @@ function lookupPartFile(partId: string): string | null {
   }
 }
 
+// Set to 'false' to skip token validation on media part redirects (LAN-only setups)
+const VALIDATE_TOKEN = process.env.GATEWAY_VALIDATE_TOKEN !== 'false';
+const TOKEN_CACHE_TTL_MS = 5 * 60_000;
+// token -> cache expiry (epoch ms); only valid tokens are cached
+const tokenCache = new Map<string, number>();
+
+/** Extracts the Plex token from the query string or headers. */
+function tokenFromRequest(req: http.IncomingMessage): string | null {
+  try {
+    const fromQuery = new URL(req.url ?? '/', 'http://gateway').searchParams.get('X-Plex-Token');
+    if (fromQuery) return fromQuery;
+  } catch {
+    // fall through to the header
+  }
+  const header = req.headers['x-plex-token'];
+  return (Array.isArray(header) ? header[0] : header) ?? null;
+}
+
+/**
+ * True when PMS accepts the token. Valid tokens are cached briefly so play
+ * requests do not hit PMS on every seek. Fails closed: an unreachable PMS or
+ * invalid token means no redirect and the request falls through to Plex.
+ */
+async function isValidToken(token: string | null): Promise<boolean> {
+  if (!token) return false;
+  const cachedUntil = tokenCache.get(token);
+  if (cachedUntil && cachedUntil > Date.now()) return true;
+  try {
+    const response = await fetch(
+      new URL(`/?X-Plex-Token=${encodeURIComponent(token)}`, PLEX_UPSTREAM),
+      { signal: AbortSignal.timeout(5000) },
+    );
+    await response.body?.cancel();
+    if (!response.ok) return false;
+    // Bound the cache so unbounded token spam cannot grow it forever
+    if (tokenCache.size > 1000) tokenCache.clear();
+    tokenCache.set(token, Date.now() + TOKEN_CACHE_TTL_MS);
+    return true;
+  } catch (err) {
+    console.warn(`token validation failed: ${(err as Error).message}`);
+    return false;
+  }
+}
+
 /** Maps a stored proxy URL to its .strm file on disk, or null if it is not one. */
 function strmPathForStored(stored: string): string | null {
   if (!stored.startsWith('http')) return null;
@@ -87,13 +131,18 @@ function metadataHasStrmPart(metadataId: string): boolean {
  * decided is a .strm. Returns the rewritten path+query, or null to pass the
  * request through untouched.
  */
-function forceDirectPlayDecision(rawUrl: string): string | null {
+function forceDirectPlayDecision(rawUrl: string, headerProduct?: string): string | null {
   let url: URL;
   try {
     url = new URL(rawUrl, 'http://gateway');
   } catch {
     return null;
   }
+  // Browsers cannot fetch cross-origin media (CORS), so leave web clients
+  // untouched; they fall back to Direct Stream through PMS instead
+  const product = url.searchParams.get('X-Plex-Product') ?? headerProduct ?? '';
+  if (product === 'Plex Web') return null;
+
   const metadataMatch = (url.searchParams.get('path') ?? '').match(/^\/library\/metadata\/(\d+)$/);
   if (!metadataMatch || !metadataHasStrmPart(metadataMatch[1])) return null;
 
@@ -165,16 +214,26 @@ const server = http.createServer(async (req, res) => {
       req.method === 'GET' || req.method === 'HEAD' ? urlPath.match(PART_PATH_RE) : null;
 
     if (partMatch) {
-      const target = await directUrlForPart(partMatch[1], req.headers['user-agent']);
-      if (target) {
-        console.log(`302  part ${partMatch[1]}  ->  ${target}`);
-        res.writeHead(302, { Location: target }).end();
-        return;
+      // Validate before resolving: unauthenticated requests must not trigger
+      // source URL resolution, and fall through to Plex's own auth (401)
+      if (!VALIDATE_TOKEN || (await isValidToken(tokenFromRequest(req)))) {
+        const target = await directUrlForPart(partMatch[1], req.headers['user-agent']);
+        if (target) {
+          console.log(`302  part ${partMatch[1]}  ->  ${target}`);
+          res.writeHead(302, { Location: target }).end();
+          return;
+        }
+      } else {
+        console.warn(`401  part ${partMatch[1]}  (missing or invalid X-Plex-Token)`);
       }
     }
 
     if (req.method === 'GET' && urlPath === DECISION_PATH) {
-      const rewritten = forceDirectPlayDecision(req.url ?? '/');
+      const productHeader = req.headers['x-plex-product'];
+      const rewritten = forceDirectPlayDecision(
+        req.url ?? '/',
+        Array.isArray(productHeader) ? productHeader[0] : productHeader,
+      );
       if (rewritten) {
         console.log(`MDE  forcing direct play  ${rewritten.slice(0, 120)}`);
         proxyThrough(req, res, rewritten);
