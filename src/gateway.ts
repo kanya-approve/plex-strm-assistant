@@ -30,6 +30,10 @@ const DB_PATH =
 // Direct-play media part URL, e.g. /library/parts/6/1751700000/file.mp4
 const PART_PATH_RE = /^\/library\/parts\/(\d+)\/\d+\/file(?:\.\w+)?$/;
 
+// Transcode decision endpoint: clients ask PMS how to play an item. For .strm
+// items the query is rewritten to force direct play before reaching PMS.
+const DECISION_PATH = '/video/:/transcode/universal/decision';
+
 let db: DatabaseSync | null = null;
 
 /** Looks up the stored file column for a media part. Returns null on any failure. */
@@ -47,6 +51,63 @@ function lookupPartFile(partId: string): string | null {
   }
 }
 
+/** Maps a stored proxy URL to its .strm file on disk, or null if it is not one. */
+function strmPathForStored(stored: string): string | null {
+  if (!stored.startsWith('http')) return null;
+  let urlPath: string;
+  try {
+    urlPath = new URL(stored).pathname;
+  } catch {
+    return null;
+  }
+  return strmPathFromUrlPath(STRM_ROOT, urlPath);
+}
+
+/** True when any media part of the metadata item resolves to a .strm file. */
+function metadataHasStrmPart(metadataId: string): boolean {
+  try {
+    db ??= new DatabaseSync(DB_PATH, { readOnly: true, timeout: 5000 });
+    const rows = db
+      .prepare(
+        `SELECT mp.file FROM media_parts mp
+         JOIN media_items mi ON mp.media_item_id = mi.id
+         WHERE mi.metadata_item_id = ?`,
+      )
+      .all(metadataId) as { file: string }[];
+    return rows.some((row) => row.file != null && strmPathForStored(row.file) !== null);
+  } catch (err) {
+    console.warn(`db lookup failed: ${(err as Error).message}`);
+    db = null;
+    return false;
+  }
+}
+
+/**
+ * Rewrites a transcode decision URL to force direct play when the item being
+ * decided is a .strm. Returns the rewritten path+query, or null to pass the
+ * request through untouched.
+ */
+function forceDirectPlayDecision(rawUrl: string): string | null {
+  let url: URL;
+  try {
+    url = new URL(rawUrl, 'http://gateway');
+  } catch {
+    return null;
+  }
+  const metadataMatch = (url.searchParams.get('path') ?? '').match(/^\/library\/metadata\/(\d+)$/);
+  if (!metadataMatch || !metadataHasStrmPart(metadataMatch[1])) return null;
+
+  url.searchParams.set('directPlay', '1');
+  // Client quality caps would otherwise veto direct play
+  url.searchParams.delete('videoBitrate');
+  url.searchParams.delete('maxVideoBitrate');
+  // Burned-in subtitles force a transcode; let Plex deliver them separately
+  if (url.searchParams.get('subtitles') === 'burn') {
+    url.searchParams.set('subtitles', 'auto');
+  }
+  return url.pathname + url.search;
+}
+
 /**
  * Resolves a media part to the final source URL if it is a .strm item.
  * Returns null when the part is a regular file or anything fails, in which
@@ -57,16 +118,9 @@ async function directUrlForPart(
   userAgent: string | undefined,
 ): Promise<string | null> {
   const stored = lookupPartFile(partId);
-  if (!stored || !stored.startsWith('http')) return null;
+  if (!stored) return null;
 
-  let urlPath: string;
-  try {
-    urlPath = new URL(stored).pathname;
-  } catch {
-    return null;
-  }
-
-  const strmPath = strmPathFromUrlPath(STRM_ROOT, urlPath);
+  const strmPath = strmPathForStored(stored);
   if (!strmPath) return null;
 
   let url: string | null;
@@ -80,10 +134,14 @@ async function directUrlForPart(
   return FOLLOW_REDIRECTS ? resolveRedirects(url, userAgent) : url;
 }
 
-/** Streams a request through to PMS unchanged. */
-function proxyThrough(req: http.IncomingMessage, res: http.ServerResponse): void {
+/** Streams a request through to PMS, optionally with a rewritten path+query. */
+function proxyThrough(
+  req: http.IncomingMessage,
+  res: http.ServerResponse,
+  urlOverride?: string,
+): void {
   const upstreamReq = http.request(
-    new URL(req.url ?? '/', PLEX_UPSTREAM),
+    new URL(urlOverride ?? req.url ?? '/', PLEX_UPSTREAM),
     {
       method: req.method,
       headers: { ...req.headers, host: PLEX_UPSTREAM.host },
@@ -111,6 +169,15 @@ const server = http.createServer(async (req, res) => {
       if (target) {
         console.log(`302  part ${partMatch[1]}  ->  ${target}`);
         res.writeHead(302, { Location: target }).end();
+        return;
+      }
+    }
+
+    if (req.method === 'GET' && urlPath === DECISION_PATH) {
+      const rewritten = forceDirectPlayDecision(req.url ?? '/');
+      if (rewritten) {
+        console.log(`MDE  forcing direct play  ${rewritten.slice(0, 120)}`);
+        proxyThrough(req, res, rewritten);
         return;
       }
     }

@@ -220,7 +220,10 @@ Default:        source (e.g. 115 CDN) -> Plex server -> client
 Gateway mode:   source (e.g. 115 CDN) ---------------> client
 ```
 
-Gateway mode removes the Plex server from the media path, similar to what [MediaWarp](https://github.com/AkimioJR/MediaWarp) does for Emby and Jellyfin. The gateway is a reverse proxy that sits in front of Plex: clients connect to it instead of the Plex port. All requests (browsing, metadata, transcoding, websockets) pass through to Plex untouched. Only direct-play requests for `.strm` items are intercepted: the gateway resolves the final source URL and answers with a `302` that the client follows, so video flows straight from the source once playback starts.
+Gateway mode removes the Plex server from the media path, similar to what [MediaWarp](https://github.com/AkimioJR/MediaWarp) does for Emby and Jellyfin. The gateway is a reverse proxy that sits in front of Plex: clients connect to it instead of the Plex port. All requests (browsing, metadata, transcoding, websockets) pass through to Plex untouched. Only two request types for `.strm` items are intercepted:
+
+- **Media part requests** (direct play): the gateway resolves the final source URL and answers with a `302` that the client follows, so video flows straight from the source once playback starts.
+- **Transcode decision requests**: when a client asks Plex how to play a `.strm` item, the gateway rewrites the request to force direct play before it reaches Plex: client quality caps are stripped and burned-in subtitles are switched to separate delivery. This coerces clients that would otherwise transcode into direct playing.
 
 The gateway reads the Plex database in read-only mode, so it is safe while Plex is running and needs no extra setup step.
 
@@ -282,6 +285,7 @@ docker logs -f strm-proxy
 A direct-play start looks like this, with the final source URL on the right:
 
 ```text
+strm-proxy | MDE  forcing direct play  /video/:/transcode/universal/decision?...directPlay=1...
 strm-proxy | 302  part 1234  ->  https://cdnfhnfile.115cdn.net/...
 ```
 
@@ -290,6 +294,7 @@ If you do not see a `302 part` line while the video plays, the client connected 
 ### Limitations
 
 - Only direct play bypasses Plex. Transcoded playback still flows through the Plex server, since Plex must read the stream to transcode it.
+- Forced direct play means the client receives the original file as-is. A client that genuinely cannot decode it (codec, HDR, container) will fail to play or fall back to transcoding on its own.
 - The client fetches the media itself, so it needs internet access to the source/CDN.
 - The gateway redirects media part requests without validating the Plex token (same as similar tools). Keep port `32500` on your LAN or behind a VPN; do not expose it to the internet.
 
