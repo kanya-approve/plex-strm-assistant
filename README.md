@@ -10,6 +10,8 @@ Enables `.strm` file playback in Plex. Plex dropped native `.strm` support, so t
 - **strm-proxy**: a lightweight HTTP server that reads a `.strm` file and returns a `302` redirect to the URL inside it.
 - **SQLite triggers**: installed once into the Plex database. Whenever Plex scans a `.strm` file, the trigger rewrites the stored path to a proxy URL (`http://strm-proxy:3000/...`). Rescans are handled automatically, so no re-patching is needed.
 
+Optionally, the [direct streaming gateway](#direct-streaming-gateway-source---client-bypassing-plex) lets clients stream straight from the source (e.g. 115 Drive) without the video passing through the Plex server.
+
 ---
 
 ## Quick start (Docker Compose)
@@ -203,38 +205,93 @@ strm-proxy:
     - FOLLOW_REDIRECTS=true
 ```
 
-On each play request the proxy follows the redirect chain (forwarding the caller's User-Agent, which services like 115 bind the stream URL to) and returns the final URL to Plex. Streaming still flows through the Plex server as normal. To stream directly from the source to your clients instead, see the gateway below.
+On each play request the proxy follows the redirect chain (forwarding the caller's User-Agent, which services like 115 bind the stream URL to) and returns the final URL to Plex. Streaming still flows through the Plex server as normal. To stream directly from the source to your clients instead, see the [direct streaming gateway](#direct-streaming-gateway-source---client-bypassing-plex).
 
 > **Note for 115 Drive:** Plex's media analysis makes many requests per file during a library scan, which can trip 115's rate limits. Keep libraries small until scan-time processing can be disabled (see Roadmap).
 
-### Direct streaming gateway (traffic bypasses the Plex server)
+---
 
-By default, Plex fetches the stream itself and relays it to your clients (source -> Plex -> client). Gateway mode removes Plex from the media path: once playback starts, video flows straight from the source to the client (e.g. 115 -> client), similar to what [MediaWarp](https://github.com/AkimioJR/MediaWarp) does for Emby and Jellyfin.
+## Direct streaming gateway (source -> client, bypassing Plex)
 
-It works as a reverse proxy in front of Plex. Clients connect to the gateway port instead of Plex. All requests pass through to Plex untouched, except direct-play requests for `.strm` items: the gateway resolves the final source URL (using a read-only view of the Plex database, safe while Plex runs) and answers with a `302` that the client follows directly.
+By default, Plex fetches the stream itself and relays it to your clients:
 
-Enable it on the proxy service and publish the gateway port:
-
-```yaml
-strm-proxy:
-  environment:
-    - GATEWAY_ENABLED=true
-    - FOLLOW_REDIRECTS=true # resolve redirector URLs (e.g. 115) per play request
-  ports:
-    - '3000:3000'
-    - '32500:32500'
+```text
+Default:        source (e.g. 115 CDN) -> Plex server -> client
+Gateway mode:   source (e.g. 115 CDN) ---------------> client
 ```
 
-Then point your clients at the gateway instead of Plex:
+Gateway mode removes the Plex server from the media path, similar to what [MediaWarp](https://github.com/AkimioJR/MediaWarp) does for Emby and Jellyfin. The gateway is a reverse proxy that sits in front of Plex: clients connect to it instead of the Plex port. All requests (browsing, metadata, transcoding, websockets) pass through to Plex untouched. Only direct-play requests for `.strm` items are intercepted: the gateway resolves the final source URL and answers with a `302` that the client follows, so video flows straight from the source once playback starts.
 
-- In Plex Web / apps, connect to `http://<your-host>:32500`
-- For automatic discovery, set **Settings > Network > Custom server access URLs** in Plex to `http://<your-host>:32500`
+The gateway reads the Plex database in read-only mode, so it is safe while Plex is running and needs no extra setup step.
 
-Notes:
+### 1. Enable the gateway
 
-- Only direct play is redirected. Transcoded playback still flows through the Plex server (Plex must read the stream to transcode it).
-- The client fetches the media itself, so it must be able to reach the source URL (internet access to the CDN).
-- Like similar tools, the gateway redirects media part requests without validating the Plex token, so keep the gateway port on your LAN or behind a VPN rather than exposing it to the internet.
+Complete the [Quick start](#quick-start-docker-compose) first, then update the `strm-proxy` service in your `docker-compose.yml`:
+
+```yaml
+services:
+  strm-proxy:
+    image: liveinaus/plex-strm-assistant
+    container_name: strm-proxy
+    environment:
+      - SKIP_SETUP=${SKIP_SETUP:-false}
+      - GATEWAY_ENABLED=true
+      # Resolve redirector URLs (e.g. 115) per play request, bound to the client
+      - FOLLOW_REDIRECTS=true
+    volumes:
+      - ./strm:/strm:ro
+      - ./plex-config:/plex-config
+    ports:
+      - '3000:3000'
+      - '32500:32500' # gateway: clients connect here instead of :32400
+    restart: unless-stopped
+```
+
+### 2. Restart the proxy
+
+Plex can keep running; the triggers are already installed:
+
+```bash
+SKIP_SETUP=true docker compose up -d strm-proxy
+```
+
+The logs should show both services:
+
+```text
+strm-proxy | strm-proxy on :3000  root: /strm
+strm-proxy | strm-gateway on :32500  ->  http://plex:32400/  (following upstream redirects)
+```
+
+### 3. Point your clients at the gateway
+
+Clients must reach Plex through port `32500` instead of `32400`:
+
+- **Plex Web:** browse to `http://<your-host>:32500/web`
+- **Plex apps (recommended):** in Plex, open **Settings > Network > Custom server access URLs** and add `http://<your-host>:32500`. Apps that discover the server through your Plex account will then connect via the gateway automatically.
+
+Use a hostname or IP that your clients can reach on your network, not `localhost`.
+
+### 4. Verify it works
+
+Play a `.strm` item and watch the gateway logs:
+
+```bash
+docker logs -f strm-proxy
+```
+
+A direct-play start looks like this, with the final source URL on the right:
+
+```text
+strm-proxy | 302  part 1234  ->  https://cdnfhnfile.115cdn.net/...
+```
+
+If you do not see a `302 part` line while the video plays, the client connected to Plex directly (check step 3) or Plex is transcoding instead of direct playing (check the playback quality settings on the client; the session dashboard in Plex shows Direct Play vs Transcode).
+
+### Limitations
+
+- Only direct play bypasses Plex. Transcoded playback still flows through the Plex server, since Plex must read the stream to transcode it.
+- The client fetches the media itself, so it needs internet access to the source/CDN.
+- The gateway redirects media part requests without validating the Plex token (same as similar tools). Keep port `32500` on your LAN or behind a VPN; do not expose it to the internet.
 
 ---
 
