@@ -27,5 +27,7 @@ ENV STRM_ROOT=/strm
 ENV PORT=3000
 
 EXPOSE 3000
+# Gateway mode (GATEWAY_ENABLED=true): clients connect here instead of PMS
+EXPOSE 32500
 
 ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]

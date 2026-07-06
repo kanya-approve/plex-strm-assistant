@@ -36,5 +36,12 @@ else
     --proxy-base "$PROXY_BASE"
 fi
 
+# Gateway mode: reverse proxy in front of PMS that 302s direct-play .strm
+# requests straight to the source, so streaming bypasses PMS entirely
+if [ "${GATEWAY_ENABLED:-false}" = "true" ]; then
+  echo "[strm-proxy] Starting gateway..."
+  node --experimental-sqlite /app/dist/gateway.js &
+fi
+
 echo "[strm-proxy] Starting proxy..."
 exec node /app/dist/proxy.js
