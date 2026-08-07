@@ -63,8 +63,7 @@ function normalise(raw: PttResult): ParsedMedia {
     out.audioLanguage = raw.languages[0];
   }
 
-  // Colour / HDR: only assert when we actually have a video signal (codec or
-  // resolution). Absence of an HDR tag in a Sonarr/Radarr name means SDR.
+  // Only assert colour when there's a video signal; no HDR tag in a Sonarr name means SDR.
   const hasVideo = out.videoCodec !== undefined || dims !== undefined;
   if (hasVideo) {
     const range = classifyDynamicRange(raw.hdr);
@@ -73,10 +72,7 @@ function normalise(raw: PttResult): ParsedMedia {
     out.colorPrimaries = color.colorPrimaries;
     out.colorSpace = color.colorSpace;
     out.dovi = color.dovi;
-
-    // A "10bit"/"8bit" token overrides the range default (e.g. 10-bit SDR).
-    const bitDepth = parseBitDepth(raw.bitDepth);
-    out.bitDepth = bitDepth ?? color.bitDepth;
+    out.bitDepth = parseBitDepth(raw.bitDepth) ?? color.bitDepth;
 
     if (out.bitDepth === 10 && !out.videoProfile && out.videoCodec === 'hevc') {
       out.videoProfile = 'main 10';
