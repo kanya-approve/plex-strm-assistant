@@ -1,48 +1,26 @@
-/**
- * Applies normalised Media-Info (ParsedMedia) to the Plex DB, writing the exact
- * columns/blobs Plex stores (verified against a real library.db):
- *
- *   media_items:   video_codec, audio_codec, width, height, audio_channels,
- *                  color_trc, extra_data(ma:videoProfile)
- *   media_streams: video row (stream_type_id=1) + audio row (stream_type_id=2),
- *                  each carrying a "ma:" extra_data blob
- *
- * Design notes:
- *  - UPDATE in place (upsert), never DELETE+INSERT, so media_streams.id values
- *    Plex uses for stream selection are preserved.
- *  - Self-healing / idempotent: if the DB already holds the values we'd write,
- *    it's a no-op. If a Plex rescan re-seeds the fake h264/aac via the trigger,
- *    the next scan/play detects the mismatch and restores the real values.
- *  - One short transaction per item; SQLITE_BUSY is retried once. WAL mode makes
- *    this safe alongside a running Plex (we go through the connection, never the
- *    -wal/-shm files directly).
- */
 import type { DatabaseSync } from 'node:sqlite';
 import type { StrmPart } from './db';
 import { ParsedMedia, buildItemExtraData, buildMaExtraData } from './plex-extra-data';
 
-const VIDEO = 1; // media_streams.stream_type_id for video
-const AUDIO = 2; // media_streams.stream_type_id for audio
+const VIDEO = 1;
+const AUDIO = 2;
 
 interface StreamPlan {
   codec?: string;
   channels?: number;
   language?: string;
-  extraData: string; // "" when there is nothing to encode
+  extraData: string;
   index: number;
 }
 
 interface WritePlan {
-  item: Record<string, string | number>; // media_items columns -> values
+  item: Record<string, string | number>;
   video?: StreamPlan;
   audio?: StreamPlan;
 }
 
-/**
- * Applies parsed Media-Info to the given part. Returns true if a write happened
- * (or would happen under dryRun), false if there was nothing to do / already
- * up to date.
- */
+// Upserts in place (never DELETE+INSERT) so media_streams.id is preserved, and is
+// idempotent, so it also heals rows a Plex rescan reverted to placeholder h264/aac.
 export function applyMediaMetadata(
   db: DatabaseSync,
   part: StrmPart,
@@ -58,9 +36,6 @@ export function applyMediaMetadata(
   return true;
 }
 
-// ---------------------------------------------------------------------------
-// Plan construction
-// ---------------------------------------------------------------------------
 
 function buildPlan(p: ParsedMedia): WritePlan {
   const item: Record<string, string | number> = {};
@@ -134,12 +109,7 @@ function hasWork(plan: WritePlan): boolean {
   return Object.keys(plan.item).length > 0 || plan.video !== undefined || plan.audio !== undefined;
 }
 
-// ---------------------------------------------------------------------------
-// Self-healing check
-// ---------------------------------------------------------------------------
-
 function isAlreadyApplied(db: DatabaseSync, part: StrmPart, plan: WritePlan): boolean {
-  // media_items
   if (Object.keys(plan.item).length > 0) {
     const cols = Object.keys(plan.item);
     const row = db
@@ -150,7 +120,6 @@ function isAlreadyApplied(db: DatabaseSync, part: StrmPart, plan: WritePlan): bo
       if (String(row[c] ?? '') !== String(plan.item[c])) return false;
     }
   }
-  // streams
   if (plan.video && !streamMatches(db, part.id, VIDEO, plan.video)) return false;
   if (plan.audio && !streamMatches(db, part.id, AUDIO, plan.audio)) return false;
   return true;
@@ -182,10 +151,6 @@ function streamMatches(
   if (s.extraData && (row.extra_data ?? '') !== s.extraData) return false;
   return true;
 }
-
-// ---------------------------------------------------------------------------
-// Writing
-// ---------------------------------------------------------------------------
 
 function writePlan(db: DatabaseSync, part: StrmPart, plan: WritePlan): void {
   db.exec('BEGIN IMMEDIATE');
@@ -250,7 +215,6 @@ function withRetry(fn: () => void): void {
     fn();
   } catch (err) {
     if (isBusy(err)) {
-      // openDb sets a busy_timeout; a single retry covers the rare lost race.
       fn();
       return;
     }

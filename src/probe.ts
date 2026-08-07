@@ -1,13 +1,3 @@
-/**
- * Ground-truth Media-Info probe of the real remote stream, using mediainfo.js
- * (a WebAssembly build of MediaInfo -- effectively "ffprobe in TypeScript", no
- * external binary). Plex itself cannot analyse remote parts, so on first play
- * the proxy probes the resolved stream URL and writes the truth.
- *
- * Only header regions are fetched, via HTTP Range requests, so the transfer is
- * tiny. Any failure (source rejects Range, network/timeout, unreadable) returns
- * null and the caller falls back to the filename-derived metadata.
- */
 import mediaInfoFactory from 'mediainfo.js';
 import type { AudioTrack, GeneralTrack, MediaInfo, VideoTrack } from 'mediainfo.js';
 import {
@@ -26,17 +16,12 @@ function getMediaInfo(): Promise<MediaInfo<'object'>> {
   if (!mediaInfoPromise) {
     mediaInfoPromise = mediaInfoFactory({
       format: 'object',
-      // In Node the wasm sits next to the package; resolve it explicitly.
       locateFile: () => require.resolve('mediainfo.js/MediaInfoModule.wasm'),
     });
   }
   return mediaInfoPromise;
 }
 
-/**
- * Probes a remote stream URL and returns normalised Media-Info fields, or null
- * if the stream could not be analysed (caller falls back to filename data).
- */
 export async function probeMedia(realUrl: string): Promise<ParsedMedia | null> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), PROBE_TIMEOUT_MS);
@@ -44,7 +29,7 @@ export async function probeMedia(realUrl: string): Promise<ParsedMedia | null> {
 
   try {
     const size = await getContentLength(realUrl, controller.signal);
-    if (!size) return null; // no Content-Length -> ranged reads aren't reliable
+    if (!size) return null;
 
     const readChunk = async (chunkSize: number, offset: number): Promise<Uint8Array> => {
       bytesRead += chunkSize;
@@ -54,7 +39,7 @@ export async function probeMedia(realUrl: string): Promise<ParsedMedia | null> {
         signal: controller.signal,
         redirect: 'follow',
       });
-      // Must be a partial response; a 200 would stream the whole file.
+      // A 200 would stream the whole file instead of the requested range.
       if (res.status !== 206) throw new Error(`range not honoured (status ${res.status})`);
       return new Uint8Array(await res.arrayBuffer());
     };
@@ -70,13 +55,12 @@ export async function probeMedia(realUrl: string): Promise<ParsedMedia | null> {
 }
 
 async function getContentLength(url: string, signal: AbortSignal): Promise<number | undefined> {
-  // Prefer HEAD; fall back to a 1-byte ranged GET for servers that reject HEAD.
   try {
     const head = await fetch(url, { method: 'HEAD', signal, redirect: 'follow' });
     const len = Number(head.headers.get('content-length'));
     if (head.ok && Number.isFinite(len) && len > 0) return len;
   } catch {
-    /* fall through */
+    // fall through to a ranged GET
   }
   try {
     const res = await fetch(url, { headers: { Range: 'bytes=0-0' }, signal, redirect: 'follow' });
@@ -84,14 +68,10 @@ async function getContentLength(url: string, signal: AbortSignal): Promise<numbe
     const total = cr && /\/(\d+)$/.exec(cr)?.[1];
     if (total) return Number(total);
   } catch {
-    /* give up */
+    // give up
   }
   return undefined;
 }
-
-// ---------------------------------------------------------------------------
-// MediaInfo result -> ParsedMedia
-// ---------------------------------------------------------------------------
 
 function mapResult(result: {
   media?: { track?: ReadonlyArray<{ '@type': string }> };
@@ -112,7 +92,7 @@ function mapResult(result: {
     if (w) out.width = w;
     if (h) out.height = h;
     out.bitDepth = toInt(video.BitDepth);
-    out.chromaSubsampling = video.ChromaSubsampling; // e.g. "4:2:0"
+    out.chromaSubsampling = video.ChromaSubsampling;
     if (video.FrameRate !== undefined) out.frameRate = String(video.FrameRate);
     if (video.Format_Profile) out.videoProfile = video.Format_Profile.toLowerCase();
     out.colorPrimaries = mapPrimaries(video.colour_primaries);
@@ -128,7 +108,6 @@ function mapResult(result: {
         blCompatId: '1',
         version: '1.0',
       };
-      // DV keeps the PQ transfer even if the tag was on HDR_Format only.
       out.colorTrc ??= 'smpte2084';
     }
   }
@@ -170,7 +149,6 @@ function mapPrimaries(v: string | undefined): string | undefined {
 
 function mapMatrix(v: string | undefined): string | undefined {
   if (!v) return undefined;
-  // "constant" luminance is rare; treat any BT.2020 matrix as non-constant (Plex's usual value).
   if (v.includes('2020')) return 'bt2020nc';
   if (v.includes('709')) return 'bt709';
   return undefined;
