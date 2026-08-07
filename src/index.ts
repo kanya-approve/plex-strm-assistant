@@ -10,6 +10,8 @@ import {
   updatePartFile,
 } from './db';
 import { readStrmUrl, walkStrm } from './strm';
+import { parseMediaFilename } from './parse';
+import { applyMediaMetadata } from './metadata';
 
 const program = new Command();
 
@@ -94,70 +96,89 @@ let updated = 0;
 let seeded = 0;
 let skipped = 0;
 let failed = 0;
+let metaUpdated = 0;
 
-for (const localPath of strmFiles) {
-  const containerPath = toContainerPath(localPath, opts.rebase);
-  const realUrl = readStrmUrl(localPath);
+async function run(): Promise<void> {
+  for (const localPath of strmFiles) {
+    const containerPath = toContainerPath(localPath, opts.rebase);
+    const realUrl = readStrmUrl(localPath);
 
-  if (!realUrl) {
-    console.warn(`  SKIP  ${localPath}\n        (empty or non-HTTP content)`);
-    skipped++;
-    continue;
+    if (!realUrl) {
+      console.warn(`  SKIP  ${localPath}\n        (empty or non-HTTP content)`);
+      skipped++;
+      continue;
+    }
+
+    // targetUrl is what gets stored in the DB:
+    //   proxy mode -> stable proxy URL (never changes when .strm content changes)
+    //   direct mode -> real URL from the .strm file
+    const targetUrl = opts.proxyBase
+      ? toProxyUrl(containerPath, opts.rebase, opts.proxyBase)
+      : realUrl;
+
+    // Provide both URLs as hints so we can find rows regardless of which was stored previously
+    const part = findPartByContainerPath(db, containerPath, [targetUrl, realUrl]);
+
+    if (!part) {
+      console.warn(
+        `  NOT IN DB  ${containerPath}` + `\n             Has Plex scanned this file yet?`,
+      );
+      skipped++;
+      continue;
+    }
+
+    const outcome = updatePartFile(db, part, containerPath, targetUrl, opts.dryRun ?? false);
+
+    if (outcome.urlUpdated) {
+      const label = opts.dryRun ? 'WOULD UPDATE' : 'UPDATED';
+      const extra = outcome.sourceSeeded ? ' (strm_source seeded)' : '';
+      console.log(`  ${label}  id=${part.id}${extra}`);
+      console.log(`    strm: ${containerPath}`);
+      console.log(`      to: ${targetUrl}`);
+      updated++;
+    } else if (outcome.sourceSeeded) {
+      const label = opts.dryRun ? 'WOULD SEED' : 'SEEDED';
+      console.log(`  ${label}  id=${part.id}  ${containerPath}`);
+      seeded++;
+    } else {
+      console.log(`  UP TO DATE  id=${part.id}  ${containerPath}`);
+      skipped++;
+    }
+
+    // Populate real Media-Info from the filename (probe fills the rest on play).
+    try {
+      const parsed = await parseMediaFilename(path.basename(containerPath));
+      if (applyMediaMetadata(db, part, parsed, opts.dryRun ?? false)) {
+        const label = opts.dryRun ? 'would set' : 'set';
+        console.log(`    meta: ${label} media info from filename`);
+        metaUpdated++;
+      }
+    } catch (err) {
+      console.warn(`    meta: FAILED  ${(err as Error).message}`);
+      failed++;
+    }
   }
 
-  // targetUrl is what gets stored in the DB:
-  //   proxy mode -> stable proxy URL (never changes when .strm content changes)
-  //   direct mode -> real URL from the .strm file
-  const targetUrl = opts.proxyBase
-    ? toProxyUrl(containerPath, opts.rebase, opts.proxyBase)
-    : realUrl;
+  const summary = [
+    `updated=${updated}`,
+    `seeded=${seeded}`,
+    `meta=${metaUpdated}`,
+    `skipped=${skipped}`,
+    `failed=${failed}`,
+  ];
+  console.log(`\nDone. ${summary.join('  ')}`);
 
-  // Provide both URLs as hints so we can find rows regardless of which was stored previously
-  const part = findPartByContainerPath(db, containerPath, [targetUrl, realUrl]);
-
-  if (!part) {
-    console.warn(
-      `  NOT IN DB  ${containerPath}` + `\n             Has Plex scanned this file yet?`,
-    );
-    skipped++;
-    continue;
-  }
-
-  const outcome = updatePartFile(db, part, containerPath, targetUrl, opts.dryRun ?? false);
-
-  if (!outcome.urlUpdated && !outcome.sourceSeeded) {
-    console.log(`  UP TO DATE  id=${part.id}  ${containerPath}`);
-    skipped++;
-    continue;
-  }
-
-  if (outcome.urlUpdated) {
-    const label = opts.dryRun ? 'WOULD UPDATE' : 'UPDATED';
-    const extra = outcome.sourceSeeded ? ' (strm_source seeded)' : '';
-    console.log(`  ${label}  id=${part.id}${extra}`);
-    console.log(`    strm: ${containerPath}`);
-    console.log(`      to: ${targetUrl}`);
-    updated++;
-  } else {
-    const label = opts.dryRun ? 'WOULD SEED' : 'SEEDED';
-    console.log(`  ${label}  id=${part.id}  ${containerPath}`);
-    seeded++;
+  if (!opts.dryRun && opts.proxyBase) {
+    if (!guardTriggerExists(db)) {
+      installGuardTrigger(db);
+      console.log('\nGuard trigger installed -- Plex rescans will no longer revert proxy URLs.');
+    } else {
+      console.log('\nGuard trigger already installed.');
+    }
   }
 }
 
-const summary = [
-  `updated=${updated}`,
-  `seeded=${seeded}`,
-  `skipped=${skipped}`,
-  `failed=${failed}`,
-];
-console.log(`\nDone. ${summary.join('  ')}`);
-
-if (!opts.dryRun && opts.proxyBase) {
-  if (!guardTriggerExists(db)) {
-    installGuardTrigger(db);
-    console.log('\nGuard trigger installed -- Plex rescans will no longer revert proxy URLs.');
-  } else {
-    console.log('\nGuard trigger already installed.');
-  }
-}
+run().catch((err) => {
+  console.error(err);
+  process.exit(1);
+});

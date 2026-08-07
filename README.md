@@ -160,6 +160,33 @@ All variables are optional. The defaults match the Quick start layout, so you on
 | `GATEWAY_PORT`           | `32500`                                                                                                               | Port the gateway listens on                                                                                                                                                       |
 | `PLEX_UPSTREAM`          | `http://plex:32400`                                                                                                   | Plex Media Server address the gateway forwards to                                                                                                                                 |
 | `GATEWAY_VALIDATE_TOKEN` | `true`                                                                                                                | Validate the `X-Plex-Token` against Plex before redirecting media part requests. Set to `false` only on LAN-only setups                                                           |
+| `PROBE_TIMEOUT_MS`       | `20000`                                                                                                               | Max time for the play-time media probe (see [Real media metadata](#real-media-metadata))                                                                                         |
+| `PROBE_MAX_BYTES`        | `33554432`                                                                                                           | Max bytes the probe may read from the source (header regions only, via HTTP Range)                                                                                               |
+
+---
+
+## Real media metadata
+
+Because a `.strm` has no local media for Plex to analyse, Plex normally shows wrong Media Info
+(the placeholder H.264/AAC the triggers seed to force direct play). This tool replaces that with
+**real** codec, resolution, HDR/Dolby Vision, bit depth, audio codec and channel info, from two
+sources:
+
+- **Filenames** — Sonarr/Radarr encode the details into the name (e.g.
+  `... - S01E12 - Title [Bluray-1080p][HDR][DTS 5.1][x265]-GROUP.strm`). These are parsed with
+  [`@viren070/parse-torrent-title`](https://github.com/Viren070/parse-torrent-title) (the parser
+  the Riven RTN package is built on) during the patch/scan and on first play. Unparseable or
+  empty tokens are simply skipped.
+- **The actual stream, on first play** — Plex cannot probe remote parts, so the proxy analyses
+  the resolved stream itself using [`mediainfo.js`](https://github.com/buzz/mediainfo.js) (a
+  WebAssembly build of MediaInfo — no external binary). It reads only the header bytes over HTTP
+  Range requests and writes the ground truth, correcting anything the filename missed. If the
+  source doesn't support Range requests the probe is skipped and the filename data stands.
+
+Writes are idempotent and self-healing: they only touch the DB when values differ, and restore
+the real metadata if a Plex rescan reverts it. Only Media Info is written — titles and matching
+are left to Plex. Requires `DB_PATH` to point at the Plex database (the default Compose layout).
+Codecs are now reported truthfully, so a client may choose to transcode.
 
 ---
 
@@ -328,6 +355,7 @@ rm -f "${DB}-wal" "${DB}-shm"
 - [x] HTTP proxy that resolves `.strm` files to stream URLs via `302` redirect
 - [x] SQLite triggers to survive Plex rescans automatically
 - [x] Inject H.264/AAC codec metadata to force direct play (no transcoding)
+- [x] Write real Media Info (codec, resolution, HDR/Dolby Vision, audio) parsed from filenames and probed from the stream on first play (see [Real media metadata](#real-media-metadata))
 - [x] Docker container that installs triggers on start, then runs the proxy
 - [x] Multi-platform image (amd64, arm64)
 - [x] Safe first-run handling: waits for the Plex DB, `SKIP_SETUP` flag for restarts

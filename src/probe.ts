@@ -1,0 +1,225 @@
+/**
+ * Ground-truth Media-Info probe of the real remote stream, using mediainfo.js
+ * (a WebAssembly build of MediaInfo -- effectively "ffprobe in TypeScript", no
+ * external binary). Plex itself cannot analyse remote parts, so on first play
+ * the proxy probes the resolved stream URL and writes the truth.
+ *
+ * Only header regions are fetched, via HTTP Range requests, so the transfer is
+ * tiny. Any failure (source rejects Range, network/timeout, unreadable) returns
+ * null and the caller falls back to the filename-derived metadata.
+ */
+import mediaInfoFactory from 'mediainfo.js';
+import type { AudioTrack, GeneralTrack, MediaInfo, VideoTrack } from 'mediainfo.js';
+import {
+  ParsedMedia,
+  channelsToLayout,
+  normaliseAudioCodec,
+  normaliseVideoCodec,
+} from './plex-extra-data';
+
+const PROBE_TIMEOUT_MS = Number(process.env.PROBE_TIMEOUT_MS ?? 20000);
+const PROBE_MAX_BYTES = Number(process.env.PROBE_MAX_BYTES ?? 32 * 1024 * 1024);
+
+let mediaInfoPromise: Promise<MediaInfo<'object'>> | undefined;
+
+function getMediaInfo(): Promise<MediaInfo<'object'>> {
+  if (!mediaInfoPromise) {
+    mediaInfoPromise = mediaInfoFactory({
+      format: 'object',
+      // In Node the wasm sits next to the package; resolve it explicitly.
+      locateFile: () => require.resolve('mediainfo.js/MediaInfoModule.wasm'),
+    });
+  }
+  return mediaInfoPromise;
+}
+
+/**
+ * Probes a remote stream URL and returns normalised Media-Info fields, or null
+ * if the stream could not be analysed (caller falls back to filename data).
+ */
+export async function probeMedia(realUrl: string): Promise<ParsedMedia | null> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), PROBE_TIMEOUT_MS);
+  let bytesRead = 0;
+
+  try {
+    const size = await getContentLength(realUrl, controller.signal);
+    if (!size) return null; // no Content-Length -> ranged reads aren't reliable
+
+    const readChunk = async (chunkSize: number, offset: number): Promise<Uint8Array> => {
+      bytesRead += chunkSize;
+      if (bytesRead > PROBE_MAX_BYTES) throw new Error('probe byte budget exceeded');
+      const res = await fetch(realUrl, {
+        headers: { Range: `bytes=${offset}-${offset + chunkSize - 1}` },
+        signal: controller.signal,
+        redirect: 'follow',
+      });
+      // Must be a partial response; a 200 would stream the whole file.
+      if (res.status !== 206) throw new Error(`range not honoured (status ${res.status})`);
+      return new Uint8Array(await res.arrayBuffer());
+    };
+
+    const mediaInfo = await getMediaInfo();
+    const result = await mediaInfo.analyzeData(size, readChunk);
+    return mapResult(result);
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function getContentLength(url: string, signal: AbortSignal): Promise<number | undefined> {
+  // Prefer HEAD; fall back to a 1-byte ranged GET for servers that reject HEAD.
+  try {
+    const head = await fetch(url, { method: 'HEAD', signal, redirect: 'follow' });
+    const len = Number(head.headers.get('content-length'));
+    if (head.ok && Number.isFinite(len) && len > 0) return len;
+  } catch {
+    /* fall through */
+  }
+  try {
+    const res = await fetch(url, { headers: { Range: 'bytes=0-0' }, signal, redirect: 'follow' });
+    const cr = res.headers.get('content-range'); // "bytes 0-0/123456"
+    const total = cr && /\/(\d+)$/.exec(cr)?.[1];
+    if (total) return Number(total);
+  } catch {
+    /* give up */
+  }
+  return undefined;
+}
+
+// ---------------------------------------------------------------------------
+// MediaInfo result -> ParsedMedia
+// ---------------------------------------------------------------------------
+
+function mapResult(result: {
+  media?: { track?: ReadonlyArray<{ '@type': string }> };
+}): ParsedMedia {
+  const tracks = result.media?.track ?? [];
+  const general = tracks.find((t) => t['@type'] === 'General') as GeneralTrack | undefined;
+  const video = tracks.find((t) => t['@type'] === 'Video') as VideoTrack | undefined;
+  const audio = tracks.find((t) => t['@type'] === 'Audio') as AudioTrack | undefined;
+
+  const out: ParsedMedia = {};
+
+  if (general?.Format) out.container = mapContainer(general.Format);
+
+  if (video) {
+    out.videoCodec = normaliseVideoCodec(video.Format);
+    const w = toInt(video.Width);
+    const h = toInt(video.Height);
+    if (w) out.width = w;
+    if (h) out.height = h;
+    out.bitDepth = toInt(video.BitDepth);
+    out.chromaSubsampling = video.ChromaSubsampling; // e.g. "4:2:0"
+    if (video.FrameRate !== undefined) out.frameRate = String(video.FrameRate);
+    if (video.Format_Profile) out.videoProfile = video.Format_Profile.toLowerCase();
+    out.colorPrimaries = mapPrimaries(video.colour_primaries);
+    out.colorSpace = mapMatrix(video.matrix_coefficients);
+    out.colorRange = mapRange(video.colour_range);
+    out.colorTrc = mapTransfer(video.transfer_characteristics, video.HDR_Format);
+    if (isDolbyVision(video.HDR_Format)) {
+      out.dovi = {
+        profile: doviProfile(video.HDR_Format_Profile),
+        blPresent: '1',
+        elPresent: '0',
+        rpuPresent: '1',
+        blCompatId: '1',
+        version: '1.0',
+      };
+      // DV keeps the PQ transfer even if the tag was on HDR_Format only.
+      out.colorTrc ??= 'smpte2084';
+    }
+  }
+
+  if (audio) {
+    out.audioCodec = normaliseAudioCodec(audio.Format);
+    const ch = channelsToLayout(audio.Channels);
+    if (ch) {
+      out.audioChannels = ch.count;
+      out.audioChannelLayout = ch.layout;
+    }
+    if (audio.SamplingRate)
+      out.samplingRate = String(toInt(audio.SamplingRate) ?? audio.SamplingRate);
+    if (audio.Language) out.audioLanguage = mapLanguage(audio.Language);
+  }
+
+  return out;
+}
+
+function toInt(v: unknown): number | undefined {
+  if (v === undefined || v === null) return undefined;
+  const n = parseInt(String(v), 10);
+  return Number.isFinite(n) ? n : undefined;
+}
+
+function mapContainer(format: string): string | undefined {
+  const f = format.toLowerCase();
+  if (f.includes('matroska')) return 'mkv';
+  if (f.includes('mpeg-4') || f.includes('mp4')) return 'mp4';
+  return undefined;
+}
+
+function mapPrimaries(v: string | undefined): string | undefined {
+  if (!v) return undefined;
+  if (v.includes('2020')) return 'bt2020';
+  if (v.includes('709')) return 'bt709';
+  return undefined;
+}
+
+function mapMatrix(v: string | undefined): string | undefined {
+  if (!v) return undefined;
+  // "constant" luminance is rare; treat any BT.2020 matrix as non-constant (Plex's usual value).
+  if (v.includes('2020')) return 'bt2020nc';
+  if (v.includes('709')) return 'bt709';
+  return undefined;
+}
+
+function mapRange(v: string | undefined): string | undefined {
+  if (!v) return undefined;
+  const r = v.toLowerCase();
+  if (r.includes('limited')) return 'tv';
+  if (r.includes('full')) return 'full';
+  return undefined;
+}
+
+function mapTransfer(v: string | undefined, hdrFormat: string | undefined): string | undefined {
+  const t = (v ?? '').toLowerCase();
+  const hdr = (hdrFormat ?? '').toLowerCase();
+  if (t.includes('2084') || t.includes('pq') || hdr.includes('hdr10') || hdr.includes('smpte'))
+    return 'smpte2084';
+  if (t.includes('hlg') || t.includes('b67') || hdr.includes('hlg')) return 'arib-std-b67';
+  if (t.includes('709')) return 'bt709';
+  return undefined;
+}
+
+function isDolbyVision(hdrFormat: string | undefined): boolean {
+  return !!hdrFormat && hdrFormat.toLowerCase().includes('dolby vision');
+}
+
+function doviProfile(profile: string | undefined): string | undefined {
+  if (!profile) return '8';
+  const m = /dvhe\.(\d{2})|profile\s*(\d)/i.exec(profile);
+  const p = m?.[1] ?? m?.[2];
+  return p ? String(Number(p)) : '8';
+}
+
+function mapLanguage(lang: string): string {
+  const l = lang.trim().toLowerCase();
+  if (l.length === 2) return l;
+  const names: Record<string, string> = {
+    english: 'en',
+    japanese: 'ja',
+    spanish: 'es',
+    french: 'fr',
+    german: 'de',
+    italian: 'it',
+    korean: 'ko',
+    chinese: 'zh',
+    portuguese: 'pt',
+    russian: 'ru',
+    hindi: 'hi',
+  };
+  return names[l] ?? l.slice(0, 2);
+}
