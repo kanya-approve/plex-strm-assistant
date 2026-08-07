@@ -1,13 +1,3 @@
-/**
- * Filename -> ParsedMedia, using @viren070/parse-torrent-title (the parser the
- * Riven RTN package is built on). This is the Media-Info source used on the
- * batch scan and as the baseline before a stream is played; ffprobe-equivalent
- * ground truth (src/probe.ts) is layered on top at play time.
- *
- * The package is ESM-only and exposes no `require` condition, so it is loaded
- * via a real dynamic import(). The Function wrapper stops TypeScript's CommonJS
- * emit from down-levelling import() to require() (which the package rejects).
- */
 import {
   ParsedMedia,
   channelsToLayout,
@@ -22,6 +12,8 @@ type PttModule = typeof import('@viren070/parse-torrent-title');
 type PttParser = InstanceType<PttModule['Parser']>;
 type PttResult = ReturnType<PttParser['parse']>;
 
+// The package is ESM-only with no `require` condition. The Function wrapper keeps
+// TypeScript's CommonJS emit from down-levelling import() to require().
 const importPtt = new Function(
   'return import("@viren070/parse-torrent-title")',
 ) as () => Promise<PttModule>;
@@ -35,12 +27,8 @@ function getParser(): Promise<PttParser> {
   return parserPromise;
 }
 
-/**
- * Parses a media file's basename into normalised Media-Info fields.
- * Never throws; unknown fields are left undefined so nothing bad is written.
- */
 export async function parseMediaFilename(basename: string): Promise<ParsedMedia> {
-  const name = basename.replace(/\.[^./]+$/, ''); // strip extension
+  const name = basename.replace(/\.[^./]+$/, '');
   try {
     const parser = await getParser();
     return normalise(parser.parse(name));
