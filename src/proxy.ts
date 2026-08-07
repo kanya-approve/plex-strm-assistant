@@ -20,11 +20,8 @@ const CONTAINER_PREFIX = process.env.CONTAINER_PREFIX ?? '/media/strm';
 const STRM_PROXY_HOST = process.env.STRM_PROXY_HOST ?? 'strm-proxy';
 const PROXY_BASE = `http://${STRM_PROXY_HOST}:${PORT}`;
 const DB_PATH = process.env.DB_PATH ?? DEFAULT_DB_PATH;
-// Writing real Media-Info into the Plex DB is opt-in.
 const WRITE_METADATA = process.env.WRITE_METADATA === 'true';
 
-// The Plex DB connection is only opened when metadata writing is enabled;
-// otherwise the proxy just serves redirects and never touches the DB.
 let db: DatabaseSync | null = null;
 if (!WRITE_METADATA) {
   console.log('Media-Info enrichment disabled (set WRITE_METADATA=true to enable)');
