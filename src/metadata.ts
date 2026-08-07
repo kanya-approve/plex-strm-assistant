@@ -36,7 +36,6 @@ export function applyMediaMetadata(
   return true;
 }
 
-
 function buildPlan(p: ParsedMedia): WritePlan {
   const item: Record<string, string | number> = {};
   if (p.videoCodec) item.video_codec = p.videoCodec;

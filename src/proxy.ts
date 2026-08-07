@@ -38,15 +38,10 @@ if (!WRITE_METADATA) {
   }
 }
 
-// Probe each item at most once per proxy lifetime (a network read of the stream).
 const probed = new Set<string>();
 
-/**
- * On play, populate real Media-Info for the item. Runs after the 302 is sent so
- * it never delays playback. Filename metadata is (cheaply) re-applied on every
- * play -- healing any fake values a Plex rescan re-seeded -- while the heavier
- * stream probe runs only once per item per session. Never throws.
- */
+// Filename metadata is re-applied on every play (cheap, heals rescan reverts);
+// the network stream probe runs only once per item per proxy session.
 async function enrich(urlPath: string, filePath: string, realUrl: string): Promise<void> {
   if (!db) return;
   try {
@@ -101,7 +96,6 @@ http
       console.log(`302  ${rawPath}  ->  ${url}`);
       res.writeHead(302, { Location: url }).end();
 
-      // Fire-and-forget: populate real Plex Media-Info after the redirect is sent.
       void enrich(rawPath, filePath, url);
     } catch (err) {
       console.error(`error handling ${req.url}: ${(err as Error).message}`);

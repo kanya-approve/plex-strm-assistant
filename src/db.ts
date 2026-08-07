@@ -62,13 +62,8 @@ export function findPartByContainerPath(
   return null;
 }
 
-/**
- * Finds the media_parts row for an incoming proxy request path, e.g.
- *   decodedPath = "/Movies/Big Buck Bunny (2008)/Big Buck Bunny (2008).mp4"
- * The stored file is the proxy URL (raw from the setup trigger, or percent-
- * encoded from the CLI patcher), so we try both plus the original .strm
- * container path (via strm_source / file lookups in findPartByContainerPath).
- */
+// The stored file is the proxy URL, raw from the setup trigger or percent-encoded
+// from the CLI patcher, so try both plus the original .strm container path.
 export function findPartByProxyPath(
   db: DatabaseSync,
   proxyBase: string,

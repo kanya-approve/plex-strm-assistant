@@ -151,7 +151,6 @@ async function run(): Promise<void> {
       skipped++;
     }
 
-    // Populate real Media-Info from the filename (opt-in; probe fills the rest on play).
     if (opts.writeMetadata) {
       try {
         const parsed = await parseMediaFilename(path.basename(containerPath));
