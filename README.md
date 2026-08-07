@@ -160,6 +160,7 @@ All variables are optional. The defaults match the Quick start layout, so you on
 | `GATEWAY_PORT`           | `32500`                                                                                                               | Port the gateway listens on                                                                                                                                                       |
 | `PLEX_UPSTREAM`          | `http://plex:32400`                                                                                                   | Plex Media Server address the gateway forwards to                                                                                                                                 |
 | `GATEWAY_VALIDATE_TOKEN` | `true`                                                                                                                | Validate the `X-Plex-Token` against Plex before redirecting media part requests. Set to `false` only on LAN-only setups                                                           |
+| `WRITE_METADATA`         | `false`                                                                                                               | Set to `true` to let the proxy write real Media Info into the Plex DB on play (see [Real media metadata](#real-media-metadata)). Off by default                                    |
 | `PROBE_TIMEOUT_MS`       | `20000`                                                                                                               | Max time for the play-time media probe (see [Real media metadata](#real-media-metadata))                                                                                         |
 | `PROBE_MAX_BYTES`        | `33554432`                                                                                                           | Max bytes the probe may read from the source (header regions only, via HTTP Range)                                                                                               |
 
@@ -168,9 +169,15 @@ All variables are optional. The defaults match the Quick start layout, so you on
 ## Real media metadata
 
 Because a `.strm` has no local media for Plex to analyse, Plex normally shows wrong Media Info
-(the placeholder H.264/AAC the triggers seed to force direct play). This tool replaces that with
-**real** codec, resolution, HDR/Dolby Vision, bit depth, audio codec and channel info, from two
-sources:
+(the placeholder H.264/AAC the triggers seed to force direct play). Optionally, this tool can
+replace that with **real** codec, resolution, HDR/Dolby Vision, bit depth, audio codec and
+channel info.
+
+> **Opt-in.** This is off by default. Enable it by setting `WRITE_METADATA=true` on the proxy
+> (for the on-play probe) and/or passing `--write-metadata` to the CLI patcher (for the
+> filename pass during a scan). With it off, the proxy never opens or writes to the Plex DB.
+
+It draws from two sources:
 
 - **Filenames** — Sonarr/Radarr encode the details into the name (e.g.
   `... - S01E12 - Title [Bluray-1080p][HDR][DTS 5.1][x265]-GROUP.strm`). These are parsed with

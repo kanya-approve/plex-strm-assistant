@@ -22,6 +22,11 @@ program
   .option('-d, --db <path>', 'Path to Plex library database', DEFAULT_DB_PATH)
   .option('--dry-run', 'Preview changes without writing to the database')
   .option(
+    '--write-metadata',
+    'Also write real Media-Info (codec, resolution, HDR, audio) parsed from ' +
+      'filenames into the Plex DB. Off by default.',
+  )
+  .option(
     '--proxy-base <url>',
     'Base URL of the strm-proxy sidecar, e.g. "http://strm-proxy:3000". ' +
       'When set the DB stores stable proxy URLs instead of the real stream URLs, ' +
@@ -40,6 +45,7 @@ program
 const opts = program.opts<{
   db: string;
   dryRun: boolean;
+  writeMetadata?: boolean;
   proxyBase?: string;
   scanStrm: string;
   rebase: string;
@@ -145,17 +151,19 @@ async function run(): Promise<void> {
       skipped++;
     }
 
-    // Populate real Media-Info from the filename (probe fills the rest on play).
-    try {
-      const parsed = await parseMediaFilename(path.basename(containerPath));
-      if (applyMediaMetadata(db, part, parsed, opts.dryRun ?? false)) {
-        const label = opts.dryRun ? 'would set' : 'set';
-        console.log(`    meta: ${label} media info from filename`);
-        metaUpdated++;
+    // Populate real Media-Info from the filename (opt-in; probe fills the rest on play).
+    if (opts.writeMetadata) {
+      try {
+        const parsed = await parseMediaFilename(path.basename(containerPath));
+        if (applyMediaMetadata(db, part, parsed, opts.dryRun ?? false)) {
+          const label = opts.dryRun ? 'would set' : 'set';
+          console.log(`    meta: ${label} media info from filename`);
+          metaUpdated++;
+        }
+      } catch (err) {
+        console.warn(`    meta: FAILED  ${(err as Error).message}`);
+        failed++;
       }
-    } catch (err) {
-      console.warn(`    meta: FAILED  ${(err as Error).message}`);
-      failed++;
     }
   }
 

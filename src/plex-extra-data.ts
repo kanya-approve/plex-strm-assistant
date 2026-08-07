@@ -1,66 +1,38 @@
-/**
- * Shared media-metadata types and Plex-storage helpers.
- *
- * `ParsedMedia` is the normalised, source-agnostic shape produced by both the
- * filename parser (src/parse.ts) and the ffprobe-equivalent stream probe
- * (src/probe.ts). It maps directly onto the columns/blobs Plex actually stores
- * (verified against a real com.plexapp.plugins.library.db):
- *
- *   media_items:   video_codec, audio_codec, width, height, audio_channels,
- *                  container, color_trc, extra_data(ma:videoProfile)
- *   media_streams: codec, channels, language, extra_data (a JSON blob of
- *                  "ma:<Attr>":"value" pairs + a url-encoded "url" mirror)
- *
- * Every field is optional: whatever a source could not determine stays
- * undefined and is simply not written (never a bad/guessed value).
- */
-
-/** Dolby Vision descriptor written into the video stream ma: blob. */
 export interface DoviInfo {
-  profile?: string; // "8", "5", "7"
+  profile?: string;
   level?: string;
-  blPresent?: string; // "1"/"0"
+  blPresent?: string;
   elPresent?: string;
   rpuPresent?: string;
   blCompatId?: string;
-  version?: string; // "1.0"
+  version?: string;
 }
 
 export interface ParsedMedia {
-  // --- media_items ---
-  videoCodec?: string; // h264 | hevc | av1
-  audioCodec?: string; // eac3 | ac3 | dca | truehd | aac | flac | opus
+  videoCodec?: string;
+  audioCodec?: string;
   width?: number;
   height?: number;
-  audioChannels?: number; // integer count: 6 = 5.1, 8 = 7.1, 2 = stereo
-  container?: string; // mp4 | mkv
-  videoProfile?: string; // e.g. "main 10", "high"
+  audioChannels?: number;
+  container?: string;
+  videoProfile?: string;
 
-  // --- video stream ma: attributes ---
-  colorTrc?: string; // smpte2084 (HDR10) | arib-std-b67 (HLG) | bt709 (SDR)
-  colorPrimaries?: string; // bt2020 | bt709
-  colorSpace?: string; // bt2020nc | bt709
-  colorRange?: string; // tv | full
-  chromaSubsampling?: string; // 4:2:0
-  bitDepth?: number; // 8 | 10
-  frameRate?: string; // "23.976"
+  colorTrc?: string;
+  colorPrimaries?: string;
+  colorSpace?: string;
+  colorRange?: string;
+  chromaSubsampling?: string;
+  bitDepth?: number;
+  frameRate?: string;
   dovi?: DoviInfo;
 
-  // --- audio stream ma: attributes ---
-  audioChannelLayout?: string; // "5.1(side)" | "7.1" | "stereo" | "mono"
-  samplingRate?: string; // "48000"
-  audioLanguage?: string; // ISO code, e.g. "eng", "jpn"
+  audioChannelLayout?: string;
+  samplingRate?: string;
+  audioLanguage?: string;
 }
 
-// ---------------------------------------------------------------------------
-// Plex extra_data blob encoding
-// ---------------------------------------------------------------------------
-
-/**
- * Percent-encodes like Plex does for the extra_data `url` mirror. This is
- * stricter than encodeURIComponent: Plex also encodes `.` `(` `)` `!` `'` `*`
- * (verified: "5.1(side)" -> "5%2E1%28side%29", "23.976" -> "23%2E976").
- */
+// Plex encodes the extra_data `url` mirror more strictly than encodeURIComponent:
+// it also escapes . ! ' ( ) *  ("5.1(side)" -> "5%2E1%28side%29").
 export function plexEncode(value: string): string {
   return encodeURIComponent(value).replace(
     /[.!'()*]/g,
@@ -68,12 +40,8 @@ export function plexEncode(value: string): string {
   );
 }
 
-/**
- * Builds a Plex media_streams `extra_data` blob from a map of `ma:` pairs.
- * Emits JSON of the pairs (ASCII-sorted keys, matching Plex's own ordering)
- * plus a `url` key holding the same pairs url-encoded -- the field Plex reads.
- * Undefined/empty values are dropped. Returns '' when nothing is left.
- */
+// Plex stores the pairs as JSON plus a url-encoded `url` mirror (the field it
+// actually reads), keys in ASCII order. Undefined/empty values are dropped.
 export function buildMaExtraData(
   pairs: Record<string, string | number | undefined | null>,
 ): string {
@@ -91,17 +59,11 @@ export function buildMaExtraData(
   return JSON.stringify(obj);
 }
 
-/** Builds the media_items.extra_data blob (just ma:videoProfile today). */
 export function buildItemExtraData(videoProfile?: string): string {
   if (!videoProfile) return '';
   return buildMaExtraData({ 'ma:videoProfile': videoProfile });
 }
 
-// ---------------------------------------------------------------------------
-// Normalisation helpers (shared by parse.ts and probe.ts)
-// ---------------------------------------------------------------------------
-
-/** Maps a resolution label (1080p / 2160p / 4k / 720p / 480p / 576p) to pixels. */
 export function resolutionToDimensions(
   resolution: string | undefined,
 ): { width: number; height: number } | undefined {
@@ -125,7 +87,6 @@ export function resolutionToDimensions(
   }
 }
 
-/** Normalises any video-codec token (x265, HEVC, AVC, h264, AV1, ...) to Plex's codec string. */
 export function normaliseVideoCodec(codec: string | undefined): string | undefined {
   if (!codec) return undefined;
   const c = codec.toLowerCase();
@@ -137,11 +98,9 @@ export function normaliseVideoCodec(codec: string | undefined): string | undefin
   return undefined;
 }
 
-/** Normalises any audio-codec token (DTS, DTS Lossy, E-AC-3, EAC3, TrueHD, ...) to Plex's codec string. */
 export function normaliseAudioCodec(codecs: string[] | string | undefined): string | undefined {
   if (!codecs) return undefined;
   const list = Array.isArray(codecs) ? codecs : [codecs];
-  // Ignore feature add-ons that are not codecs themselves.
   const candidates = list.filter((c) => !/^(atmos|dual|dolby digital plus)$/i.test(c.trim()));
   const pool = (candidates.length ? candidates : list).join(' ').toLowerCase();
   if (pool.includes('truehd') || pool.includes('mlp')) return 'truehd';
@@ -162,7 +121,6 @@ export function normaliseAudioCodec(codecs: string[] | string | undefined): stri
   return undefined;
 }
 
-/** Maps a channels token ("5.1", "7.1", "2.0") to a count and a Plex channel layout. */
 export function channelsToLayout(
   channels: string | number | undefined,
 ): { count: number; layout: string } | undefined {
@@ -185,7 +143,6 @@ export function channelsToLayout(
     case '1':
       return { count: 1, layout: 'mono' };
     default: {
-      // Fall back to the leading integer (e.g. "5.1" handled above; "3" -> 3ch)
       const n = parseInt(s, 10);
       return Number.isFinite(n) && n > 0 ? { count: n, layout: `${n}ch` } : undefined;
     }
@@ -194,7 +151,6 @@ export function channelsToLayout(
 
 export type DynamicRange = 'sdr' | 'hdr10' | 'hlg' | 'dovi';
 
-/** Colour attributes derived from a dynamic-range classification. */
 export interface ColorInfo {
   colorTrc: string;
   colorPrimaries: string;
@@ -203,7 +159,6 @@ export interface ColorInfo {
   dovi?: DoviInfo;
 }
 
-/** Classifies HDR tokens (from a filename or a probe) into a dynamic range + colour set. */
 export function classifyDynamicRange(tokens: string[] | undefined): DynamicRange {
   const t = (tokens ?? []).join(' ').toLowerCase();
   if (t.includes('dolby vision') || /\bdv\b/.test(t) || t.includes('dovi') || t.includes('dvhe'))
@@ -214,7 +169,6 @@ export function classifyDynamicRange(tokens: string[] | undefined): DynamicRange
   return 'sdr';
 }
 
-/** Builds the colour attribute set for a dynamic range. */
 export function colorInfoFor(range: DynamicRange): ColorInfo {
   switch (range) {
     case 'dovi':
@@ -252,11 +206,6 @@ export function colorInfoFor(range: DynamicRange): ColorInfo {
   }
 }
 
-/**
- * Merges two ParsedMedia objects, `override` winning per-field where defined
- * (used to layer probe results over filename results). The nested `dovi`
- * object is replaced wholesale when the override has one.
- */
 export function mergeParsed(base: ParsedMedia, override: ParsedMedia): ParsedMedia {
   const out: ParsedMedia = { ...base };
   for (const [k, v] of Object.entries(override) as [keyof ParsedMedia, unknown][]) {

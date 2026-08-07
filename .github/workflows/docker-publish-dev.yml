@@ -4,7 +4,6 @@ on:
   push:
     tags:
       - dev-*
-  workflow_dispatch:
 
 jobs:
   build-and-push-dev:
@@ -14,7 +13,6 @@ jobs:
       contents: read
       packages: write
 
-    # Docker Hub is optional: if the secret isn't set the image still publishes to ghcr.io
     env:
       DOCKERHUB_ENABLED: ${{ secrets.DOCKERHUB_USERNAME != '' }}
 

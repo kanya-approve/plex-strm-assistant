@@ -20,19 +20,25 @@ const CONTAINER_PREFIX = process.env.CONTAINER_PREFIX ?? '/media/strm';
 const STRM_PROXY_HOST = process.env.STRM_PROXY_HOST ?? 'strm-proxy';
 const PROXY_BASE = `http://${STRM_PROXY_HOST}:${PORT}`;
 const DB_PATH = process.env.DB_PATH ?? DEFAULT_DB_PATH;
+// Writing real Media-Info into the Plex DB is opt-in.
+const WRITE_METADATA = process.env.WRITE_METADATA === 'true';
 
-// The Plex DB connection is optional: without it the proxy still serves
-// redirects, just without writing real Media-Info.
+// The Plex DB connection is only opened when metadata writing is enabled;
+// otherwise the proxy just serves redirects and never touches the DB.
 let db: DatabaseSync | null = null;
-try {
-  if (fs.existsSync(DB_PATH)) {
-    db = openDb(DB_PATH);
-    console.log(`Media-Info enrichment enabled (db: ${DB_PATH})`);
-  } else {
-    console.log(`Media-Info enrichment disabled (no DB at ${DB_PATH})`);
+if (!WRITE_METADATA) {
+  console.log('Media-Info enrichment disabled (set WRITE_METADATA=true to enable)');
+} else {
+  try {
+    if (fs.existsSync(DB_PATH)) {
+      db = openDb(DB_PATH);
+      console.log(`Media-Info enrichment enabled (db: ${DB_PATH})`);
+    } else {
+      console.log(`Media-Info enrichment disabled (no DB at ${DB_PATH})`);
+    }
+  } catch (err) {
+    console.warn(`Media-Info enrichment disabled (${(err as Error).message})`);
   }
-} catch (err) {
-  console.warn(`Media-Info enrichment disabled (${(err as Error).message})`);
 }
 
 // Probe each item at most once per proxy lifetime (a network read of the stream).
