@@ -157,6 +157,7 @@ All variables are optional. The defaults match the Quick start layout, so you on
 | `SKIP_SETUP`             | `false`                                                                                                               | Set to `true` to skip trigger installation (safe while Plex is running)                                                                                                           |
 | `FOLLOW_REDIRECTS`       | `false`                                                                                                               | Set to `true` to resolve the source URL's redirect chain server-side and return the final URL to Plex. Needed for services where the `.strm` URL is a redirector (e.g. 115 Drive) |
 | `GATEWAY_ENABLED`        | `false`                                                                                                               | Set to `true` to start the direct streaming gateway alongside the proxy                                                                                                           |
+| `GATEWAY_MODE`           | `direct-play`                                                                                                         | `direct-play`: client fetches the source (302). `direct-stream`: gateway relays the source bytes for in-cluster/private sources (see [gateway](#direct-streaming-gateway-source---client-bypassing-plex)) |
 | `GATEWAY_PORT`           | `32500`                                                                                                               | Port the gateway listens on                                                                                                                                                       |
 | `PLEX_UPSTREAM`          | `http://plex:32400`                                                                                                   | Plex Media Server address the gateway forwards to                                                                                                                                 |
 | `GATEWAY_VALIDATE_TOKEN` | `true`                                                                                                                | Validate the `X-Plex-Token` against Plex before redirecting media part requests. Set to `false` only on LAN-only setups                                                           |
@@ -255,12 +256,21 @@ Default:        source (e.g. 115 CDN) -> Plex server -> client
 Gateway mode:   source (e.g. 115 CDN) ---------------> client
 ```
 
-Gateway mode removes the Plex server from the media path, similar to what [MediaWarp](https://github.com/AkimioJR/MediaWarp) does for Emby and Jellyfin. The gateway is a reverse proxy that sits in front of Plex: clients connect to it instead of the Plex port. All requests (browsing, metadata, transcoding, websockets) pass through to Plex untouched. Only two request types for `.strm` items are intercepted:
+The gateway is a reverse proxy that sits in front of Plex: clients connect to it instead of the Plex port. All requests (browsing, metadata, transcoding, websockets) pass through to Plex untouched. Only two request types for `.strm` items are intercepted, and how they're handled depends on `GATEWAY_MODE`:
 
-- **Media part requests** (direct play): the gateway resolves the final source URL and answers with a `302` that the client follows, so video flows straight from the source once playback starts.
-- **Transcode decision requests**: when a client asks Plex how to play a `.strm` item, the gateway rewrites the request to force direct play before it reaches Plex: client quality caps are stripped and burned-in subtitles are switched to separate delivery. This coerces clients that would otherwise transcode into direct playing. Plex Web is exempt: browsers block cross-origin media fetches (CORS), so web clients fall back to Direct Stream through the Plex server instead.
+**`direct-play` (default)** — removes the Plex server from the media path (similar to what [MediaWarp](https://github.com/AkimioJR/MediaWarp) does for Emby/Jellyfin). Use when the source is reachable by your clients (e.g. a public CDN).
 
-The gateway reads the Plex database in read-only mode, so it is safe while Plex is running and needs no extra setup step.
+- **Media part requests**: the gateway resolves the final source URL and answers with a `302` the client follows, so video flows straight from the source.
+- **Transcode decision requests**: rewritten to force Direct Play (quality caps stripped, burned-in subtitles switched to separate delivery), coercing clients that would otherwise transcode into direct playing.
+
+**`direct-stream`** — the gateway **relays the source bytes itself** (Range-aware), so an off-network client never has to reach the source. Use when the source is only reachable in-cluster / on a private network (e.g. `http://…svc.cluster.local`, or the in-pod proxy). Requires `WRITE_METADATA` is irrelevant to this — it works with either fake or real Media Info.
+
+- **Media part requests**: the gateway streams the source through itself instead of 302-ing.
+- **Transcode decision requests**: rewritten to Direct Stream (`directPlay=0`, `directStream=1`) so Plex also relays via its own transcode session where clients use that path.
+
+In both modes, Plex Web is exempt (browsers block cross-origin media fetches via CORS and already fall back to Direct Stream through Plex), and non-`.strm` items pass straight through. The gateway reads the Plex database read-only, so it is safe while Plex runs and needs no extra setup step.
+
+> **Which mode?** If your `.strm` URLs point at something your phone/TV can reach directly → `direct-play`. If they point at an in-cluster/private source only the server can reach (the classic "works on web, fails in the app with connection refused" case) → `direct-stream`. Clients must be pointed at the gateway either way, or nothing is intercepted.
 
 ### 1. Enable the gateway
 
@@ -274,6 +284,8 @@ services:
     environment:
       - SKIP_SETUP=${SKIP_SETUP:-false}
       - GATEWAY_ENABLED=true
+      # direct-play (default) or direct-stream (relay in-cluster/private sources)
+      - GATEWAY_MODE=direct-play
       # Resolve redirector URLs (e.g. 115) per play request, bound to the client
       - FOLLOW_REDIRECTS=true
     volumes:
@@ -369,6 +381,7 @@ rm -f "${DB}-wal" "${DB}-shm"
 - [ ] Disable unnecessary Plex processing on `.strm` items (analysis, thumbnail generation, etc.)
 - [x] Follow 302 redirects from the source URL before returning to Plex (`FOLLOW_REDIRECTS=true`), enabling compatibility with services that require a redirect step (e.g. 115 Drive)
 - [x] Direct streaming gateway (`GATEWAY_ENABLED=true`): direct-play traffic goes straight from the source to the client, bypassing the Plex server (MediaWarp-style)
+- [x] Gateway `direct-stream` mode (`GATEWAY_MODE=direct-stream`): relay the source bytes through the gateway for sources only reachable in-cluster / on a private network
 
 ---
 
