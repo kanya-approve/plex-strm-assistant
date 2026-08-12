@@ -6,6 +6,9 @@
   "bin": {
     "plex-strm-assistant": "dist/index.js"
   },
+  "engines": {
+    "node": ">=24"
+  },
   "scripts": {
     "build": "tsc",
     "dev": "node -r ts-node/register src/index.ts",

@@ -1,20 +1,23 @@
 import type { DatabaseSync } from 'node:sqlite';
 import type { StrmPart } from './db';
-import { ParsedMedia, buildItemExtraData, buildMaExtraData } from './plex-extra-data';
+import { ParsedMedia, maExtraDataContains, mergeMaExtraData } from './plex-extra-data';
 
 const VIDEO = 1;
 const AUDIO = 2;
+
+type MaPairs = Record<string, string | number | undefined | null>;
 
 interface StreamPlan {
   codec?: string;
   channels?: number;
   language?: string;
-  extraData: string;
+  extra: MaPairs;
   index: number;
 }
 
 interface WritePlan {
   item: Record<string, string | number>;
+  itemExtra: MaPairs;
   video?: StreamPlan;
   audio?: StreamPlan;
 }
@@ -44,23 +47,21 @@ function buildPlan(p: ParsedMedia): WritePlan {
   if (p.height) item.height = p.height;
   if (p.audioChannels) item.audio_channels = p.audioChannels;
   if (p.colorTrc) item.color_trc = p.colorTrc;
-  const itemExtra = buildItemExtraData(p.videoProfile);
-  if (itemExtra) item.extra_data = itemExtra;
 
-  const plan: WritePlan = { item };
+  const plan: WritePlan = { item, itemExtra: { 'ma:videoProfile': p.videoProfile } };
 
-  const videoBlob = buildVideoBlob(p);
-  if (p.videoCodec || videoBlob) {
-    plan.video = { codec: p.videoCodec, extraData: videoBlob, index: 0 };
+  const videoExtra = videoExtraData(p);
+  if (p.videoCodec || hasAny(videoExtra)) {
+    plan.video = { codec: p.videoCodec, extra: videoExtra, index: 0 };
   }
 
-  const audioBlob = buildAudioBlob(p);
-  if (p.audioCodec || p.audioChannels || audioBlob) {
+  const audioExtra = audioExtraData(p);
+  if (p.audioCodec || p.audioChannels || hasAny(audioExtra)) {
     plan.audio = {
       codec: p.audioCodec,
       channels: p.audioChannels,
       language: p.audioLanguage,
-      extraData: audioBlob,
+      extra: audioExtra,
       index: 1,
     };
   }
@@ -68,8 +69,8 @@ function buildPlan(p: ParsedMedia): WritePlan {
   return plan;
 }
 
-function buildVideoBlob(p: ParsedMedia): string {
-  return buildMaExtraData({
+function videoExtraData(p: ParsedMedia): MaPairs {
+  return {
     'ma:bitDepth': p.bitDepth,
     'ma:chromaSubsampling': p.chromaSubsampling,
     'ma:codedHeight': p.height,
@@ -94,29 +95,43 @@ function buildVideoBlob(p: ParsedMedia): string {
           'ma:DOVIVersion': p.dovi.version,
         }
       : {}),
-  });
+  };
 }
 
-function buildAudioBlob(p: ParsedMedia): string {
-  return buildMaExtraData({
+function audioExtraData(p: ParsedMedia): MaPairs {
+  return {
     'ma:audioChannelLayout': p.audioChannelLayout,
     'ma:samplingRate': p.samplingRate,
-  });
+  };
+}
+
+function hasAny(pairs: MaPairs): boolean {
+  return Object.values(pairs).some((v) => v !== undefined && v !== null && v !== '');
 }
 
 function hasWork(plan: WritePlan): boolean {
-  return Object.keys(plan.item).length > 0 || plan.video !== undefined || plan.audio !== undefined;
+  return (
+    Object.keys(plan.item).length > 0 ||
+    hasAny(plan.itemExtra) ||
+    plan.video !== undefined ||
+    plan.audio !== undefined
+  );
 }
 
 function isAlreadyApplied(db: DatabaseSync, part: StrmPart, plan: WritePlan): boolean {
-  if (Object.keys(plan.item).length > 0) {
-    const cols = Object.keys(plan.item);
+  const cols = Object.keys(plan.item);
+  const needExtra = hasAny(plan.itemExtra);
+  if (cols.length > 0 || needExtra) {
+    const selectCols = [...cols, ...(needExtra ? ['extra_data'] : [])];
     const row = db
-      .prepare(`SELECT ${cols.join(', ')} FROM media_items WHERE id = ?`)
+      .prepare(`SELECT ${selectCols.join(', ')} FROM media_items WHERE id = ?`)
       .get(part.mediaItemId) as Record<string, unknown> | undefined;
     if (!row) return false;
     for (const c of cols) {
       if (String(row[c] ?? '') !== String(plan.item[c])) return false;
+    }
+    if (needExtra && !maExtraDataContains(row.extra_data as string | null, plan.itemExtra)) {
+      return false;
     }
   }
   if (plan.video && !streamMatches(db, part.id, VIDEO, plan.video)) return false;
@@ -130,12 +145,14 @@ function streamMatches(
   streamType: number,
   s: StreamPlan,
 ): boolean {
+  // Match the single stream at the plan's index -- never the whole type, so a
+  // real extra track (a second audio stream) is neither compared nor rewritten.
   const row = db
     .prepare(
       `SELECT codec, channels, language, extra_data
-       FROM media_streams WHERE media_part_id = ? AND stream_type_id = ? LIMIT 1`,
+       FROM media_streams WHERE media_part_id = ? AND stream_type_id = ? AND "index" = ?`,
     )
-    .get(partId, streamType) as
+    .get(partId, streamType, s.index) as
     | {
         codec: string | null;
         channels: number | null;
@@ -147,19 +164,30 @@ function streamMatches(
   if (s.codec !== undefined && (row.codec ?? '') !== s.codec) return false;
   if (s.channels !== undefined && (row.channels ?? 0) !== s.channels) return false;
   if (s.language !== undefined && (row.language ?? '') !== s.language) return false;
-  if (s.extraData && (row.extra_data ?? '') !== s.extraData) return false;
+  if (hasAny(s.extra) && !maExtraDataContains(row.extra_data as string | null, s.extra)) {
+    return false;
+  }
   return true;
 }
 
 function writePlan(db: DatabaseSync, part: StrmPart, plan: WritePlan): void {
   db.exec('BEGIN IMMEDIATE');
   try {
-    if (Object.keys(plan.item).length > 0) {
-      const cols = Object.keys(plan.item);
-      const assignments = cols.map((c) => `${c} = ?`).join(', ');
+    const cols = Object.keys(plan.item);
+    const needExtra = hasAny(plan.itemExtra);
+    if (cols.length > 0 || needExtra) {
+      const sets = cols.map((c) => `${c} = ?`);
+      const params: (string | number)[] = cols.map((c) => plan.item[c]);
+      if (needExtra) {
+        const current = db
+          .prepare(`SELECT extra_data FROM media_items WHERE id = ?`)
+          .get(part.mediaItemId) as { extra_data: string | null } | undefined;
+        sets.push('extra_data = ?');
+        params.push(mergeMaExtraData(current?.extra_data, plan.itemExtra));
+      }
       db.prepare(
-        `UPDATE media_items SET ${assignments}, updated_at = strftime('%s','now') WHERE id = ?`,
-      ).run(...cols.map((c) => plan.item[c]), part.mediaItemId);
+        `UPDATE media_items SET ${sets.join(', ')}, updated_at = strftime('%s','now') WHERE id = ?`,
+      ).run(...params, part.mediaItemId);
     }
     if (plan.video) upsertStream(db, part, VIDEO, plan.video);
     if (plan.audio) upsertStream(db, part, AUDIO, plan.audio);
@@ -171,41 +199,49 @@ function writePlan(db: DatabaseSync, part: StrmPart, plan: WritePlan): void {
 }
 
 function upsertStream(db: DatabaseSync, part: StrmPart, streamType: number, s: StreamPlan): void {
+  // Merge into the existing blob so a Plex-written extra_data keeps its keys.
+  const current = db
+    .prepare(
+      `SELECT extra_data FROM media_streams
+       WHERE media_part_id = ? AND stream_type_id = ? AND "index" = ?`,
+    )
+    .get(part.id, streamType, s.index) as { extra_data: string | null } | undefined;
+  const mergedExtra = hasAny(s.extra) ? mergeMaExtraData(current?.extra_data, s.extra) : null;
+
   const res = db
     .prepare(
       `UPDATE media_streams
        SET codec = COALESCE(?, codec),
            channels = COALESCE(?, channels),
            language = COALESCE(?, language),
-           extra_data = CASE WHEN ? <> '' THEN ? ELSE extra_data END,
+           extra_data = COALESCE(?, extra_data),
            updated_at = strftime('%s','now')
-       WHERE media_part_id = ? AND stream_type_id = ?`,
+       WHERE media_part_id = ? AND stream_type_id = ? AND "index" = ?`,
     )
-    .run(
-      s.codec ?? null,
-      s.channels ?? null,
-      s.language ?? null,
-      s.extraData,
-      s.extraData,
-      part.id,
-      streamType,
-    );
+    .run(s.codec ?? null, s.channels ?? null, s.language ?? null, mergedExtra, part.id, streamType, s.index);
 
   if (res.changes === 0) {
-    db.prepare(
-      `INSERT INTO media_streams
-         (stream_type_id, media_item_id, media_part_id, codec, channels, language, "index", extra_data, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, strftime('%s','now'), strftime('%s','now'))`,
-    ).run(
-      streamType,
-      part.mediaItemId,
-      part.id,
-      s.codec ?? null,
-      s.channels ?? null,
-      s.language ?? null,
-      s.index,
-      s.extraData || null,
-    );
+    // Seed a placeholder only when the part has no stream of this type at all,
+    // so a synthetic row is never inserted alongside real analysed tracks.
+    const exists = db
+      .prepare(`SELECT 1 FROM media_streams WHERE media_part_id = ? AND stream_type_id = ? LIMIT 1`)
+      .get(part.id, streamType);
+    if (!exists) {
+      db.prepare(
+        `INSERT INTO media_streams
+           (stream_type_id, media_item_id, media_part_id, codec, channels, language, "index", extra_data, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, strftime('%s','now'), strftime('%s','now'))`,
+      ).run(
+        streamType,
+        part.mediaItemId,
+        part.id,
+        s.codec ?? null,
+        s.channels ?? null,
+        s.language ?? null,
+        s.index,
+        mergedExtra,
+      );
+    }
   }
 }
 

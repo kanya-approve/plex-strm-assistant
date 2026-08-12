@@ -64,6 +64,44 @@ export function buildItemExtraData(videoProfile?: string): string {
   return buildMaExtraData({ 'ma:videoProfile': videoProfile });
 }
 
+// Parses a stored extra_data blob back into its ma: pairs, dropping the url mirror
+// (rebuilt on write) so existing values can be merged rather than overwritten.
+export function parseMaExtraData(blob: string | null | undefined): Record<string, string> {
+  const out: Record<string, string> = {};
+  if (!blob) return out;
+  try {
+    const obj = JSON.parse(blob) as Record<string, unknown>;
+    for (const [k, v] of Object.entries(obj)) {
+      if (k === 'url') continue;
+      if (typeof v === 'string' || typeof v === 'number') out[k] = String(v);
+    }
+  } catch {
+    // Not the JSON form we write -- treat as empty and let the caller overlay.
+  }
+  return out;
+}
+
+// Overlays additions onto whatever is already stored and rebuilds the blob, so a
+// Plex-written extra_data keeps its keys instead of being replaced wholesale.
+export function mergeMaExtraData(
+  existing: string | null | undefined,
+  additions: Record<string, string | number | undefined | null>,
+): string {
+  return buildMaExtraData({ ...parseMaExtraData(existing), ...additions });
+}
+
+export function maExtraDataContains(
+  existing: string | null | undefined,
+  additions: Record<string, string | number | undefined | null>,
+): boolean {
+  const base = parseMaExtraData(existing);
+  for (const [k, v] of Object.entries(additions)) {
+    if (v === undefined || v === null || v === '') continue;
+    if (base[k] !== String(v)) return false;
+  }
+  return true;
+}
+
 export function resolutionToDimensions(
   resolution: string | undefined,
 ): { width: number; height: number } | undefined {

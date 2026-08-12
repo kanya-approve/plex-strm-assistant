@@ -18,7 +18,9 @@
  */
 import fs from 'fs';
 import http from 'http';
+import https from 'https';
 import net from 'net';
+import tls from 'tls';
 import path from 'path';
 import { Readable } from 'node:stream';
 import { DatabaseSync } from 'node:sqlite';
@@ -27,6 +29,8 @@ import { normaliseStrmUrl, resolveRedirects, strmPathFromUrlPath } from './strm'
 const STRM_ROOT = path.resolve(process.env.STRM_ROOT ?? '/strm');
 const GATEWAY_PORT = Number(process.env.GATEWAY_PORT ?? 32500);
 const PLEX_UPSTREAM = new URL(process.env.PLEX_UPSTREAM ?? 'http://plex:32400');
+const UPSTREAM_IS_HTTPS = PLEX_UPSTREAM.protocol === 'https:';
+const UPSTREAM_PORT = Number(PLEX_UPSTREAM.port || (UPSTREAM_IS_HTTPS ? 443 : 80));
 const FOLLOW_REDIRECTS = process.env.FOLLOW_REDIRECTS === 'true';
 const DIRECT_STREAM = process.env.GATEWAY_MODE === 'direct-stream';
 const DB_PATH =
@@ -217,7 +221,9 @@ async function relayPart(
   const controller = new AbortController();
   res.on('close', () => controller.abort());
 
-  const headers: Record<string, string> = {};
+  // Ask for no compression: we relay the upstream content-length verbatim, and
+  // fetch would otherwise decompress the body while the length stayed compressed.
+  const headers: Record<string, string> = { 'accept-encoding': 'identity' };
   const range = req.headers['range'];
   if (typeof range === 'string') headers.range = range;
   const ua = req.headers['user-agent'];
@@ -255,13 +261,23 @@ async function relayPart(
   body.pipe(res);
 }
 
+/** True for browser-originated requests (Sec-Fetch-* / Origin), which native
+ *  Plex clients never send. Browsers can't follow a cross-origin 302 (CORS). */
+function isBrowserRequest(req: http.IncomingMessage): boolean {
+  return !!(
+    req.headers['sec-fetch-mode'] ||
+    req.headers['sec-fetch-dest'] ||
+    req.headers['origin']
+  );
+}
+
 /** Streams a request through to PMS, optionally with a rewritten path+query. */
 function proxyThrough(
   req: http.IncomingMessage,
   res: http.ServerResponse,
   urlOverride?: string,
 ): void {
-  const upstreamReq = http.request(
+  const upstreamReq = (UPSTREAM_IS_HTTPS ? https : http).request(
     new URL(urlOverride ?? req.url ?? '/', PLEX_UPSTREAM),
     {
       method: req.method,
@@ -291,7 +307,9 @@ const server = http.createServer(async (req, res) => {
       if (!VALIDATE_TOKEN || (await isValidToken(tokenFromRequest(req)))) {
         const target = await directUrlForPart(partMatch[1], req.headers['user-agent']);
         if (target) {
-          if (DIRECT_STREAM) {
+          // Relay (same-origin) for direct-stream mode and for browsers, which
+          // would otherwise be blocked by CORS following a cross-origin 302.
+          if (DIRECT_STREAM || isBrowserRequest(req)) {
             console.log(`relay  part ${partMatch[1]}  ->  ${target}`);
             await relayPart(req, res, target);
           } else {
@@ -329,7 +347,7 @@ const server = http.createServer(async (req, res) => {
 
 // Plex clients use websockets (/:/websockets) -- tunnel upgrades to PMS raw
 server.on('upgrade', (req, socket, head) => {
-  const upstream = net.connect(Number(PLEX_UPSTREAM.port || 80), PLEX_UPSTREAM.hostname, () => {
+  const relay = (): void => {
     let rawHead = `${req.method} ${req.url} HTTP/1.1\r\n`;
     for (let i = 0; i < req.rawHeaders.length; i += 2) {
       const name = req.rawHeaders[i];
@@ -339,7 +357,11 @@ server.on('upgrade', (req, socket, head) => {
     upstream.write(rawHead + '\r\n');
     if (head.length) upstream.write(head);
     socket.pipe(upstream).pipe(socket);
-  });
+  };
+  // Match the upstream scheme -- a plaintext socket to an https PMS would hang.
+  const upstream = UPSTREAM_IS_HTTPS
+    ? tls.connect(UPSTREAM_PORT, PLEX_UPSTREAM.hostname, { servername: PLEX_UPSTREAM.hostname }, relay)
+    : net.connect(UPSTREAM_PORT, PLEX_UPSTREAM.hostname, relay);
   upstream.on('error', () => socket.destroy());
   socket.on('error', () => upstream.destroy());
 });

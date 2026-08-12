@@ -11,8 +11,6 @@ RUN npm run build
 FROM node:26-alpine
 WORKDIR /app
 
-# Production deps only (no native sqlite3, Node's built-in node:sqlite is used --
-# stable/unflagged on Node 26, so no --experimental-sqlite needed)
 COPY package*.json ./
 RUN npm ci --omit=dev
 

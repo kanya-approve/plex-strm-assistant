@@ -391,6 +391,12 @@ rm -f "${DB}-wal" "${DB}-shm"
 
 ---
 
+## Running from source
+
+The Docker image ships Node 26, and the published CLI targets **Node 24 or newer** (`engines` in `package.json`). On those versions `node:sqlite` is stable, so the npm scripts run it directly — the old `--experimental-sqlite` flag is no longer required. On older runtimes (Node 22 LTS) `node:sqlite` is still flagged and `npm start` / `npm run dev` will fail; upgrade Node rather than re-adding the flag.
+
+---
+
 ## Contributing
 
 Contributions are welcome! Whether it's a bug fix, a new feature, or an idea from the roadmap, feel free to open an issue or submit a pull request.

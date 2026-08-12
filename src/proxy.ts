@@ -4,11 +4,11 @@ import http from 'http';
 import path from 'path';
 import type { DatabaseSync } from 'node:sqlite';
 import { readStrmUrl, resolveRedirects, strmPathFromUrlPath } from './strm';
-import { DEFAULT_DB_PATH, findPartByProxyPath, openDb } from './db';
+import { DEFAULT_DB_PATH, findPartByProxyPath, markPartProbed, openDb } from './db';
 import { parseMediaFilename } from './parse';
 import { probeMedia } from './probe';
 import { applyMediaMetadata } from './metadata';
-import { mergeParsed } from './plex-extra-data';
+import { mergeParsed, ParsedMedia } from './plex-extra-data';
 
 const STRM_ROOT = path.resolve(process.env.STRM_ROOT ?? '/strm');
 const PORT = Number(process.env.PORT ?? 3000);
@@ -23,27 +23,65 @@ const DB_PATH = process.env.DB_PATH ?? DEFAULT_DB_PATH;
 const WRITE_METADATA = process.env.WRITE_METADATA === 'true';
 
 let db: DatabaseSync | null = null;
-if (!WRITE_METADATA) {
-  console.log('Media-Info enrichment disabled (set WRITE_METADATA=true to enable)');
-} else {
+let dbIno = 0;
+
+// Returns the current DB handle, reopening it when the underlying file changes.
+// Plex's "Optimize database" replaces the file with a fresh inode, and a handle
+// held over that swap would silently write into the orphaned old file. Keying on
+// the inode also lets enrichment start once Plex creates the DB after a bare boot.
+function currentDb(): DatabaseSync | null {
+  if (!WRITE_METADATA) return null;
+  let ino: number;
   try {
-    if (fs.existsSync(DB_PATH)) {
-      db = openDb(DB_PATH);
-      console.log(`Media-Info enrichment enabled (db: ${DB_PATH})`);
-    } else {
-      console.log(`Media-Info enrichment disabled (no DB at ${DB_PATH})`);
-    }
+    ino = fs.statSync(DB_PATH).ino;
+  } catch {
+    if (db) closeDb();
+    return null;
+  }
+  if (db && ino === dbIno) return db;
+  if (db) closeDb();
+  try {
+    db = openDb(DB_PATH);
+    dbIno = ino;
+    return db;
   } catch (err) {
-    console.warn(`Media-Info enrichment disabled (${(err as Error).message})`);
+    console.warn(`Media-Info enrichment: cannot open db (${(err as Error).message})`);
+    return null;
   }
 }
 
-const probed = new Set<string>();
+function closeDb(): void {
+  try {
+    db?.close();
+  } catch {
+    // already gone
+  }
+  db = null;
+  dbIno = 0;
+}
 
-// Filename metadata is re-applied on every play (cheap, heals rescan reverts);
-// the network stream probe runs only once per item per proxy session.
-async function enrich(urlPath: string, filePath: string, realUrl: string): Promise<void> {
-  if (!db) return;
+if (!WRITE_METADATA) {
+  console.log('Media-Info enrichment disabled (set WRITE_METADATA=true to enable)');
+} else if (currentDb()) {
+  console.log(`Media-Info enrichment enabled (db: ${DB_PATH})`);
+} else {
+  console.log(`Media-Info enrichment waiting for db at ${DB_PATH}`);
+}
+
+// Once a network probe succeeds its result is authoritative for this session and
+// is re-applied on later plays to heal rescan reverts -- filename guesses never
+// overwrite it again. `probing` guards against overlapping probes of one item.
+const probeResults = new Map<string, ParsedMedia>();
+const probing = new Set<string>();
+
+async function enrich(
+  urlPath: string,
+  filePath: string,
+  realUrl: string,
+  userAgent: string | undefined,
+): Promise<void> {
+  const activeDb = currentDb();
+  if (!activeDb) return;
   try {
     let decodedPath: string;
     try {
@@ -52,17 +90,44 @@ async function enrich(urlPath: string, filePath: string, realUrl: string): Promi
       decodedPath = urlPath;
     }
 
-    const part = findPartByProxyPath(db, PROXY_BASE, CONTAINER_PREFIX, decodedPath);
+    const part = findPartByProxyPath(activeDb, PROXY_BASE, CONTAINER_PREFIX, decodedPath);
     if (!part) return;
 
     const parsed = await parseMediaFilename(path.basename(filePath));
-    applyMediaMetadata(db, part, parsed, false);
 
-    if (probed.has(decodedPath)) return;
-    probed.add(decodedPath);
+    // A probe already succeeded: its data wins. Re-apply it (heals rescan
+    // reverts) and never regress to the weaker filename guess.
+    const probed = probeResults.get(decodedPath);
+    if (probed) {
+      applyMediaMetadata(activeDb, part, probed, false);
+      return;
+    }
 
-    const probe = await probeMedia(realUrl);
-    if (probe) applyMediaMetadata(db, part, mergeParsed(parsed, probe), false);
+    // Populate from the filename immediately -- unless a probe already succeeded
+    // in an earlier session (persisted), where the stored data is stronger.
+    if (!part.probed) applyMediaMetadata(activeDb, part, parsed, false);
+
+    // Probe once per item, never concurrently (the resolved source URL is
+    // single-use and the MediaInfo instance is serialised). Failures retry.
+    if (probing.has(decodedPath)) return;
+    probing.add(decodedPath);
+    try {
+      const probe = await probeMedia(realUrl, userAgent);
+      if (probe) {
+        const merged = mergeParsed(parsed, probe);
+        probeResults.set(decodedPath, merged);
+        applyMediaMetadata(activeDb, part, merged, false);
+        if (!part.probed) {
+          try {
+            markPartProbed(activeDb, part);
+          } catch {
+            // best-effort: re-marked on the next session's probe
+          }
+        }
+      }
+    } finally {
+      probing.delete(decodedPath);
+    }
   } catch (err) {
     console.warn(`meta: enrichment failed for ${urlPath}: ${(err as Error).message}`);
   }
@@ -95,7 +160,7 @@ const server = http.createServer(async (req, res) => {
     console.log(`302  ${rawPath}  ->  ${url}`);
     res.writeHead(302, { Location: url }).end();
 
-    void enrich(rawPath, filePath, url);
+    void enrich(rawPath, filePath, url, req.headers['user-agent']);
   } catch (err) {
     console.error(`error handling ${req.url}: ${(err as Error).message}`);
     if (!res.headersSent) res.writeHead(500).end('Internal error');

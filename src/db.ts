@@ -9,6 +9,7 @@ export type StrmPart = {
   mediaItemId: number;
   extraData: string | null;
   strmSource: string | null;
+  probed: boolean;
 };
 
 export type UpdateOutcome = {
@@ -109,10 +110,14 @@ export function updatePartFile(
 
 // -- types & helpers --
 
-type RawPart = Omit<StrmPart, 'strmSource'> & { extraData: string | null };
+type RawPart = Omit<StrmPart, 'strmSource' | 'probed'> & { extraData: string | null };
 
 function toStrmPart(raw: RawPart): StrmPart {
-  return { ...raw, strmSource: parseStrmSource(raw.extraData) };
+  return {
+    ...raw,
+    strmSource: parseStrmSource(raw.extraData),
+    probed: parseProbedFlag(raw.extraData),
+  };
 }
 
 function parseStrmSource(extraData: string | null): string | null {
@@ -126,7 +131,32 @@ function parseStrmSource(extraData: string | null): string | null {
   }
 }
 
+function parseProbedFlag(extraData: string | null): boolean {
+  if (!extraData) return false;
+  try {
+    const obj = JSON.parse(extraData) as Record<string, unknown>;
+    return obj['strm_probed'] === true || obj['strm_probed'] === 1;
+  } catch {
+    return false;
+  }
+}
+
+/** Records that a network probe has already enriched this part, so later plays
+ *  keep the probe's accurate metadata instead of re-applying filename guesses. */
+export function markPartProbed(db: DatabaseSync, part: StrmPart): void {
+  const merged = injectExtraDataKey(part.extraData, 'strm_probed', true);
+  db.prepare(`UPDATE media_parts SET extra_data = ? WHERE id = ?`).run(merged, part.id);
+}
+
 function injectStrmSource(extraData: string | null, strmPath: string): string {
+  return injectExtraDataKey(extraData, 'strm_source', strmPath);
+}
+
+function injectExtraDataKey(
+  extraData: string | null,
+  key: string,
+  value: string | boolean,
+): string {
   let obj: Record<string, unknown> = {};
   if (extraData) {
     try {
@@ -135,7 +165,7 @@ function injectStrmSource(extraData: string | null, strmPath: string): string {
       obj = { _raw: extraData };
     }
   }
-  obj['strm_source'] = strmPath;
+  obj[key] = value;
   return JSON.stringify(obj);
 }
 

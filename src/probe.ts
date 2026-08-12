@@ -22,20 +22,40 @@ function getMediaInfo(): Promise<MediaInfo<'object'>> {
   return mediaInfoPromise;
 }
 
-export async function probeMedia(realUrl: string): Promise<ParsedMedia | null> {
+// The MediaInfo instance is shared and single-threaded: a second analyzeData()
+// started while one is in progress rejects ("cannot start a new analysis while
+// another is in progress"). Serialise all analyses through one promise chain so
+// overlapping plays queue instead of corrupting each other.
+let analysisChain: Promise<unknown> = Promise.resolve();
+function analyzeExclusive<T>(fn: () => Promise<T>): Promise<T> {
+  const run = analysisChain.then(fn, fn);
+  analysisChain = run.then(
+    () => undefined,
+    () => undefined,
+  );
+  return run;
+}
+
+function uaHeaders(userAgent?: string): Record<string, string> {
+  return userAgent ? { 'user-agent': userAgent } : {};
+}
+
+export async function probeMedia(realUrl: string, userAgent?: string): Promise<ParsedMedia | null> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), PROBE_TIMEOUT_MS);
   let bytesRead = 0;
 
   try {
-    const size = await getContentLength(realUrl, controller.signal);
+    const size = await getContentLength(realUrl, controller.signal, userAgent);
     if (!size) return null;
 
     const readChunk = async (chunkSize: number, offset: number): Promise<Uint8Array> => {
       bytesRead += chunkSize;
       if (bytesRead > PROBE_MAX_BYTES) throw new Error('probe byte budget exceeded');
       const res = await fetch(realUrl, {
-        headers: { Range: `bytes=${offset}-${offset + chunkSize - 1}` },
+        // Forward the caller's UA: redirector services (e.g. 115) bind the
+        // resolved URL to the agent that requested it, so a bare probe 403s.
+        headers: { Range: `bytes=${offset}-${offset + chunkSize - 1}`, ...uaHeaders(userAgent) },
         signal: controller.signal,
         redirect: 'follow',
       });
@@ -45,7 +65,7 @@ export async function probeMedia(realUrl: string): Promise<ParsedMedia | null> {
     };
 
     const mediaInfo = await getMediaInfo();
-    const result = await mediaInfo.analyzeData(size, readChunk);
+    const result = await analyzeExclusive(() => mediaInfo.analyzeData(size, readChunk));
     return mapResult(result);
   } catch {
     return null;
@@ -54,18 +74,33 @@ export async function probeMedia(realUrl: string): Promise<ParsedMedia | null> {
   }
 }
 
-async function getContentLength(url: string, signal: AbortSignal): Promise<number | undefined> {
+async function getContentLength(
+  url: string,
+  signal: AbortSignal,
+  userAgent?: string,
+): Promise<number | undefined> {
   try {
-    const head = await fetch(url, { method: 'HEAD', signal, redirect: 'follow' });
+    const head = await fetch(url, {
+      method: 'HEAD',
+      headers: uaHeaders(userAgent),
+      signal,
+      redirect: 'follow',
+    });
     const len = Number(head.headers.get('content-length'));
     if (head.ok && Number.isFinite(len) && len > 0) return len;
   } catch {
     // fall through to a ranged GET
   }
   try {
-    const res = await fetch(url, { headers: { Range: 'bytes=0-0' }, signal, redirect: 'follow' });
+    const res = await fetch(url, {
+      headers: { Range: 'bytes=0-0', ...uaHeaders(userAgent) },
+      signal,
+      redirect: 'follow',
+    });
     const cr = res.headers.get('content-range'); // "bytes 0-0/123456"
     const total = cr && /\/(\d+)$/.exec(cr)?.[1];
+    // Drain the body so the pooled connection is released, not left dangling.
+    await res.body?.cancel();
     if (total) return Number(total);
   } catch {
     // give up
