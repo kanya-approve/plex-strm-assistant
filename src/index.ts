@@ -13,12 +13,16 @@ import { readStrmUrl, walkStrm } from './strm';
 import { parseMediaFilename } from './parse';
 import { applyMediaMetadata } from './metadata';
 
+// Read at runtime rather than imported: package.json sits outside rootDir, so
+// importing it would break the dist layout. Resolves from both src/ and dist/.
+const { version } = require('../package.json') as { version: string };
+
 const program = new Command();
 
 program
   .name('plex-strm-assistant')
   .description('Replaces .strm file paths in the Plex database with the URLs they contain')
-  .version('1.0.0')
+  .version(version)
   .option('-d, --db <path>', 'Path to Plex library database', DEFAULT_DB_PATH)
   .option('--dry-run', 'Preview changes without writing to the database')
   .option(

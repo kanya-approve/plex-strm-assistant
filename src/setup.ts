@@ -41,8 +41,10 @@ const opts = program.opts<{
 function proxyUrlExpr(pathExpr: string): string {
   const base = opts.proxyBase.replace(/\/$/, '');
   const prefix = opts.containerPrefix;
-  // substr strips the container prefix; the REPLACE swaps the extension.
-  return `'${base}' || REPLACE(substr(${pathExpr}, length('${prefix}') + 1), '.strm', '.mp4')`;
+  // substr strips the container prefix and the trailing ".strm" (5 chars) in one
+  // step. A blanket REPLACE would also rewrite ".strm" appearing mid-path.
+  const body = `substr(${pathExpr}, length('${prefix}') + 1, length(${pathExpr}) - length('${prefix}') - 5)`;
+  return `'${base}' || ${body} || '.mp4'`;
 }
 
 const likePattern = `${opts.containerPrefix}/%.strm`;
@@ -50,16 +52,29 @@ const likePattern = `${opts.containerPrefix}/%.strm`;
 // Stream info block injected into both triggers.
 // Inserts placeholder H.264/AAC stream entries so Plex's MDE has codec data
 // and chooses direct play instead of transcoding -- only for these items.
+//
+// These are a fallback, not a replacement. Real stream rows (extra audio tracks,
+// embedded or sidecar subtitles) are left untouched, so anything Plex analysed
+// survives the rescans that re-fire this trigger. The media_items update runs
+// first so it only forces codecs while we are the ones supplying the data.
 const streamInfoSql = `
-  DELETE FROM media_streams WHERE media_part_id = NEW.id;
+  UPDATE media_items SET video_codec = 'h264', audio_codec = 'aac', container = 'mp4'
+  WHERE id = NEW.media_item_id
+    AND NOT EXISTS (
+      SELECT 1 FROM media_streams
+      WHERE media_part_id = NEW.id AND stream_type_id = 1);
   INSERT INTO media_streams
     (stream_type_id, media_item_id, media_part_id, codec, "index", created_at, updated_at)
-  VALUES (1, NEW.media_item_id, NEW.id, 'h264', 0, strftime('%s','now'), strftime('%s','now'));
+  SELECT 1, NEW.media_item_id, NEW.id, 'h264', 0, strftime('%s','now'), strftime('%s','now')
+  WHERE NOT EXISTS (
+    SELECT 1 FROM media_streams
+    WHERE media_part_id = NEW.id AND stream_type_id = 1);
   INSERT INTO media_streams
     (stream_type_id, media_item_id, media_part_id, codec, channels, "index", created_at, updated_at)
-  VALUES (2, NEW.media_item_id, NEW.id, 'aac', 2, 1, strftime('%s','now'), strftime('%s','now'));
-  UPDATE media_items SET video_codec = 'h264', audio_codec = 'aac', container = 'mp4'
-  WHERE id = NEW.media_item_id;`;
+  SELECT 2, NEW.media_item_id, NEW.id, 'aac', 2, 1, strftime('%s','now'), strftime('%s','now')
+  WHERE NOT EXISTS (
+    SELECT 1 FROM media_streams
+    WHERE media_part_id = NEW.id AND stream_type_id = 2);`;
 
 const insertTriggerSql = `
 CREATE TRIGGER IF NOT EXISTS strm_auto_patch_insert
@@ -134,15 +149,21 @@ const seedAudioSql = `
       SELECT 1 FROM media_streams ms
       WHERE ms.media_part_id = mp.id AND ms.stream_type_id = 2)`;
 
+// Only force codecs on items Plex has no video stream for, so real analysis results stand.
 const seedMediaItemsSql = `
   UPDATE media_items SET video_codec = 'h264', audio_codec = 'aac', container = 'mp4'
   WHERE id IN (
-    SELECT DISTINCT media_item_id FROM media_parts
-    WHERE file LIKE '${opts.proxyBase.replace(/\/$/, '')}%' AND deleted_at IS NULL)`;
+    SELECT DISTINCT mp.media_item_id FROM media_parts mp
+    WHERE mp.file LIKE '${opts.proxyBase.replace(/\/$/, '')}%'
+      AND mp.deleted_at IS NULL
+      AND NOT EXISTS (
+        SELECT 1 FROM media_streams ms
+        WHERE ms.media_part_id = mp.id AND ms.stream_type_id = 1))`;
 
+// Runs before the stream seeds, which would otherwise satisfy its NOT EXISTS guard.
+const itemsUpdated = db.prepare(seedMediaItemsSql).run();
 db.exec(seedStreamsSql);
 db.exec(seedAudioSql);
-const itemsUpdated = db.prepare(seedMediaItemsSql).run();
 if (itemsUpdated.changes > 0) {
   console.log(`Seeded stream info (h264/aac) for ${itemsUpdated.changes} existing proxy item(s).`);
 }

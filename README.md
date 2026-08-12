@@ -354,6 +354,12 @@ If you do not see a `302 part` line while the video plays, the client connected 
 
 The proxy could not find the Plex database at `DB_PATH`. Make sure Plex has been started at least once (step 3 of the Quick start) and that the Plex config directory is mounted at `/plex-config` in the proxy container.
 
+### Embedded subtitles or extra audio tracks are missing
+
+Plex is not given real stream data for a remote URL, so the triggers seed a placeholder H.264/AAC pair to keep direct play working. That placeholder describes one video and one stereo audio track only, so embedded subtitle and secondary audio tracks do not appear on their own. Real probing of the source is on the roadmap.
+
+Sidecar subtitles do work in the meantime: put a `.srt` next to the `.strm` with a matching base name (`Movie (2008).strm` and `Movie (2008).en.srt`) and rescan the library. The triggers leave any stream Plex discovers in place, including on later rescans.
+
 ### "Database disk image is malformed"
 
 If Plex reports this, recover the database:
