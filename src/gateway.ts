@@ -14,7 +14,7 @@
  *     when the source is only reachable in-cluster, so an off-network client
  *     never has to reach it.
  *
- * The Plex database is opened read-only, so it is safe while Plex runs.
+ * DB lookups are read-only; the probe-on-play write uses a separate writable handle.
  */
 import fs from 'fs';
 import http from 'http';
@@ -25,6 +25,11 @@ import path from 'path';
 import { Readable } from 'node:stream';
 import { DatabaseSync } from 'node:sqlite';
 import { normaliseStrmUrl, resolveRedirects, strmPathFromUrlPath } from './strm';
+import { findPartById, markPartProbed, openDb } from './db';
+import { parseMediaFilename } from './parse';
+import { probeMedia } from './probe';
+import { applyMediaMetadata } from './metadata';
+import { mergeParsed } from './plex-extra-data';
 
 const STRM_ROOT = path.resolve(process.env.STRM_ROOT ?? '/strm');
 const GATEWAY_PORT = Number(process.env.GATEWAY_PORT ?? 32500);
@@ -59,6 +64,42 @@ function lookupPartFile(partId: string): string | null {
     db = null; // reopen on next request; the DB may not exist yet on first run
     return null;
   }
+}
+
+const WRITE_METADATA = process.env.WRITE_METADATA === 'true';
+
+// Writable handle for probe writes; reopens on inode change (Plex "Optimize").
+let writeDb: DatabaseSync | null = null;
+let writeDbIno = 0;
+function metadataDb(): DatabaseSync | null {
+  if (!WRITE_METADATA) return null;
+  let ino: number;
+  try {
+    ino = fs.statSync(DB_PATH).ino;
+  } catch {
+    if (writeDb) closeWriteDb();
+    return null;
+  }
+  if (writeDb && ino === writeDbIno) return writeDb;
+  if (writeDb) closeWriteDb();
+  try {
+    writeDb = openDb(DB_PATH);
+    writeDbIno = ino;
+    return writeDb;
+  } catch (err) {
+    console.warn(`probe-on-play: cannot open db (${(err as Error).message})`);
+    return null;
+  }
+}
+
+function closeWriteDb(): void {
+  try {
+    writeDb?.close();
+  } catch {
+    // already gone
+  }
+  writeDb = null;
+  writeDbIno = 0;
 }
 
 // Set to 'false' to skip token validation on media part redirects (LAN-only setups)
@@ -198,6 +239,49 @@ async function directUrlForPart(
   return FOLLOW_REDIRECTS ? resolveRedirects(url, userAgent) : url;
 }
 
+// The network probe. Only the part handler calls this, and only real playback
+// reaches the part handler (Plex's analyser hits the proxy). Once per item, ever.
+const probingParts = new Set<string>();
+async function enrichOnPlay(
+  partId: string,
+  sourceUrl: string,
+  userAgent: string | undefined,
+): Promise<void> {
+  if (!WRITE_METADATA || probingParts.has(partId)) return;
+  const wdb = metadataDb();
+  if (!wdb) return;
+
+  let part;
+  try {
+    part = findPartById(wdb, partId);
+  } catch (err) {
+    console.warn(`probe-on-play: part lookup failed for ${partId}: ${(err as Error).message}`);
+    return;
+  }
+  if (!part || part.probed) return;
+
+  const strmPath = strmPathForStored(part.file);
+  const filename = strmPath ? path.basename(strmPath) : path.basename(part.file);
+
+  probingParts.add(partId);
+  try {
+    const parsed = await parseMediaFilename(filename);
+    const probe = await probeMedia(sourceUrl, userAgent);
+    if (!probe) return;
+    applyMediaMetadata(wdb, part, mergeParsed(parsed, probe), false);
+    try {
+      markPartProbed(wdb, part);
+    } catch {
+      // best-effort: re-marked on the next play
+    }
+    console.log(`probe  part ${partId}  metadata written`);
+  } catch (err) {
+    console.warn(`probe-on-play failed for part ${partId}: ${(err as Error).message}`);
+  } finally {
+    probingParts.delete(partId);
+  }
+}
+
 const RELAY_HEADERS = [
   'content-type',
   'content-length',
@@ -307,6 +391,8 @@ const server = http.createServer(async (req, res) => {
       if (!VALIDATE_TOKEN || (await isValidToken(tokenFromRequest(req)))) {
         const target = await directUrlForPart(partMatch[1], req.headers['user-agent']);
         if (target) {
+          // Genuine playback -- the only place we probe. Fire-and-forget.
+          void enrichOnPlay(partMatch[1], target, req.headers['user-agent']);
           // Relay (same-origin) for direct-stream mode and for browsers, which
           // would otherwise be blocked by CORS following a cross-origin 302.
           if (DIRECT_STREAM || isBrowserRequest(req)) {
@@ -369,7 +455,8 @@ server.on('upgrade', (req, socket, head) => {
 server.listen(GATEWAY_PORT, () =>
   console.log(
     `strm-gateway on :${GATEWAY_PORT}  ->  ${PLEX_UPSTREAM.href}  [${DIRECT_STREAM ? 'direct-stream' : 'direct-play'}]` +
-      (FOLLOW_REDIRECTS ? '  (following upstream redirects)' : ''),
+      (FOLLOW_REDIRECTS ? '  (following upstream redirects)' : '') +
+      (WRITE_METADATA ? '  (probe-on-play metadata)' : ''),
   ),
 );
 

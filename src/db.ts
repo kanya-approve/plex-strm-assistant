@@ -79,6 +79,16 @@ export function findPartByProxyPath(
   return findPartByContainerPath(db, strmContainer, [rawUrl, encodedUrl]);
 }
 
+export function findPartById(db: DatabaseSync, id: string | number): StrmPart | null {
+  const raw = db
+    .prepare(
+      `SELECT id, file, size, media_item_id AS mediaItemId, extra_data AS extraData
+       FROM media_parts WHERE id = ?`,
+    )
+    .get(id) as RawPart | undefined;
+  return raw ? toStrmPart(raw) : null;
+}
+
 export function updatePartFile(
   db: DatabaseSync,
   part: StrmPart,
