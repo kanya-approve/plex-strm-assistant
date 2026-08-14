@@ -321,6 +321,17 @@ Clients must reach Plex through port `32500` instead of `32400`:
 
 Use a hostname or IP that your clients can reach on your network, not `localhost`.
 
+### Secure connections (`app.plex.tv`)
+
+`app.plex.tv` is served over HTTPS and refuses an insecure server connection, so a plain-HTTP gateway triggers _"unable to connect securely."_ Set `GATEWAY_TLS=true` and the gateway serves the client side with Plex's own `plex.direct` certificate — read from the shared Plex config volume — so `app.plex.tv` validates it exactly as it would the real server. The cert is reloaded automatically when Plex renews it.
+
+`GATEWAY_TLS`:
+
+- `false` (default) — plain HTTP.
+- `true` — HTTPS with Plex's `plex.direct` cert. **The gateway exits on startup if the cert can't be loaded** (bad config mount, or Plex hasn't generated its cert yet).
+
+For HTTPS, route the address Plex advertises for secure connections — its `plex.direct` host on port `32400` — to the gateway (external `:32400` → gateway). The Plex config volume must be mounted into the proxy container (it already is, for DB access); the cert is found relative to `DB_PATH`.
+
 ### 4. Verify it works
 
 Play a `.strm` item and watch the gateway logs:

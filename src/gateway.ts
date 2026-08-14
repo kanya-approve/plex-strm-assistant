@@ -16,6 +16,7 @@
  *
  * DB lookups are read-only; the probe-on-play write uses a separate writable handle.
  */
+import crypto from 'crypto';
 import fs from 'fs';
 import http from 'http';
 import https from 'https';
@@ -41,6 +42,10 @@ const DIRECT_STREAM = process.env.GATEWAY_MODE === 'direct-stream';
 const DB_PATH =
   process.env.DB_PATH ??
   '/plex-config/Library/Application Support/Plex Media Server/Plug-in Support/Databases/com.plexapp.plugins.library.db';
+
+const GATEWAY_TLS = process.env.GATEWAY_TLS === 'true';
+// <config dir>/Plug-in Support/Databases/<db> -> the DB sits two levels down.
+const PLEX_CONFIG_DIR = path.resolve(path.dirname(DB_PATH), '../..');
 
 // Direct-play media part URL, e.g. /library/parts/6/1751700000/file.mp4
 const PART_PATH_RE = /^\/library\/parts\/(\d+)\/\d+\/file(?:\.\w+)?$/;
@@ -379,7 +384,30 @@ function proxyThrough(
   req.pipe(upstreamReq);
 }
 
-const server = http.createServer(async (req, res) => {
+function resolveCertPath(): string {
+  const cacheDir = path.join(PLEX_CONFIG_DIR, 'Cache');
+  const preferred = path.join(cacheDir, 'cert-v2.p12');
+  if (fs.existsSync(preferred)) return preferred;
+  const found = fs.readdirSync(cacheDir).find((f) => f.endsWith('.p12'));
+  if (!found) throw new Error(`no .p12 cert found in ${cacheDir}`);
+  return path.join(cacheDir, found);
+}
+
+// Passphrase is SHA512("plex" + ProcessedMachineIdentifier) -- Plex's own scheme.
+function loadPlexTls(): { pfx: Buffer; passphrase: string } {
+  const prefs = fs.readFileSync(path.join(PLEX_CONFIG_DIR, 'Preferences.xml'), 'utf-8');
+  const id = /ProcessedMachineIdentifier="([^"]+)"/.exec(prefs)?.[1];
+  if (!id) throw new Error('ProcessedMachineIdentifier missing from Preferences.xml');
+  const passphrase = crypto.createHash('sha512').update('plex' + id).digest('hex');
+  const pfx = fs.readFileSync(resolveCertPath());
+  tls.createSecureContext({ pfx, passphrase });
+  return { pfx, passphrase };
+}
+
+const handleRequest = async (
+  req: http.IncomingMessage,
+  res: http.ServerResponse,
+): Promise<void> => {
   try {
     const urlPath = (req.url ?? '/').split(/[?#]/)[0];
     const partMatch =
@@ -429,7 +457,31 @@ const server = http.createServer(async (req, res) => {
     console.error(`error handling ${req.url}: ${(err as Error).message}`);
     if (!res.headersSent) res.writeHead(500).end('Internal error');
   }
-});
+};
+
+function buildServer(): http.Server {
+  if (!GATEWAY_TLS) return http.createServer(handleRequest);
+  let tlsOpts: { pfx: Buffer; passphrase: string };
+  try {
+    tlsOpts = loadPlexTls();
+  } catch (err) {
+    console.error(`FATAL: cannot load Plex TLS cert: ${(err as Error).message}`);
+    console.error('Fix the Plex config mount, or set GATEWAY_TLS=false to run over plain HTTP.');
+    process.exit(1);
+  }
+  const s = https.createServer(tlsOpts, handleRequest);
+  // Plex renews the cert (~90d); reload so we present the current one.
+  setInterval(() => {
+    try {
+      s.setSecureContext(loadPlexTls());
+    } catch (err) {
+      console.warn(`gateway: TLS cert reload failed: ${(err as Error).message}`);
+    }
+  }, 21_600_000).unref();
+  return s;
+}
+
+const server = buildServer();
 
 // Plex clients use websockets (/:/websockets) -- tunnel upgrades to PMS raw
 server.on('upgrade', (req, socket, head) => {
@@ -452,9 +504,10 @@ server.on('upgrade', (req, socket, head) => {
   socket.on('error', () => upstream.destroy());
 });
 
+const scheme = GATEWAY_TLS ? 'https' : 'http';
 server.listen(GATEWAY_PORT, () =>
   console.log(
-    `strm-gateway on :${GATEWAY_PORT}  ->  ${PLEX_UPSTREAM.href}  [${DIRECT_STREAM ? 'direct-stream' : 'direct-play'}]` +
+    `strm-gateway on ${scheme}://:${GATEWAY_PORT}  ->  ${PLEX_UPSTREAM.href}  [${DIRECT_STREAM ? 'direct-stream' : 'direct-play'}]` +
       (FOLLOW_REDIRECTS ? '  (following upstream redirects)' : '') +
       (WRITE_METADATA ? '  (probe-on-play metadata)' : ''),
   ),
