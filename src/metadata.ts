@@ -17,6 +17,7 @@ interface StreamPlan {
 
 interface WritePlan {
   item: Record<string, string | number>;
+  part: Record<string, string | number>;
   itemExtra: MaPairs;
   video?: StreamPlan;
   audio?: StreamPlan;
@@ -47,8 +48,17 @@ function buildPlan(p: ParsedMedia): WritePlan {
   if (p.height) item.height = p.height;
   if (p.audioChannels) item.audio_channels = p.audioChannels;
   if (p.colorTrc) item.color_trc = p.colorTrc;
+  if (p.durationMs) item.duration = p.durationMs;
+  if (p.bitrate) item.bitrate = p.bitrate;
+  const fps = Number(p.frameRate);
+  if (Number.isFinite(fps) && fps > 0) item.frames_per_second = fps;
+  if (p.width && p.height) item.display_aspect_ratio = p.width / p.height;
 
-  const plan: WritePlan = { item, itemExtra: { 'ma:videoProfile': p.videoProfile } };
+  const part: Record<string, string | number> = {};
+  if (p.durationMs) part.duration = p.durationMs;
+  if (p.sizeBytes) part.size = p.sizeBytes;
+
+  const plan: WritePlan = { item, part, itemExtra: { 'ma:videoProfile': p.videoProfile } };
 
   const videoExtra = videoExtraData(p);
   if (p.videoCodec || hasAny(videoExtra)) {
@@ -112,6 +122,7 @@ function hasAny(pairs: MaPairs): boolean {
 function hasWork(plan: WritePlan): boolean {
   return (
     Object.keys(plan.item).length > 0 ||
+    Object.keys(plan.part).length > 0 ||
     hasAny(plan.itemExtra) ||
     plan.video !== undefined ||
     plan.audio !== undefined
@@ -128,15 +139,34 @@ function isAlreadyApplied(db: DatabaseSync, part: StrmPart, plan: WritePlan): bo
       .get(part.mediaItemId) as Record<string, unknown> | undefined;
     if (!row) return false;
     for (const c of cols) {
-      if (String(row[c] ?? '') !== String(plan.item[c])) return false;
+      if (!valueMatches(row[c], plan.item[c])) return false;
     }
     if (needExtra && !maExtraDataContains(row.extra_data as string | null, plan.itemExtra)) {
       return false;
     }
   }
+  const partCols = Object.keys(plan.part);
+  if (partCols.length > 0) {
+    const row = db
+      .prepare(`SELECT ${partCols.join(', ')} FROM media_parts WHERE id = ?`)
+      .get(part.id) as Record<string, unknown> | undefined;
+    if (!row) return false;
+    for (const c of partCols) {
+      if (!valueMatches(row[c], plan.part[c])) return false;
+    }
+  }
   if (plan.video && !streamMatches(db, part.id, VIDEO, plan.video)) return false;
   if (plan.audio && !streamMatches(db, part.id, AUDIO, plan.audio)) return false;
   return true;
+}
+
+// Plex stores these as 32-bit floats, so 23.976 reads back as 23.976024627685547.
+function valueMatches(current: unknown, want: string | number): boolean {
+  if (typeof want === 'number' && !Number.isInteger(want)) {
+    const n = Number(current);
+    return Number.isFinite(n) && Math.abs(n - want) < 0.001;
+  }
+  return String(current ?? '') === String(want);
 }
 
 function streamMatches(
@@ -188,6 +218,12 @@ function writePlan(db: DatabaseSync, part: StrmPart, plan: WritePlan): void {
       db.prepare(
         `UPDATE media_items SET ${sets.join(', ')}, updated_at = strftime('%s','now') WHERE id = ?`,
       ).run(...params, part.mediaItemId);
+    }
+    const partCols = Object.keys(plan.part);
+    if (partCols.length > 0) {
+      db.prepare(
+        `UPDATE media_parts SET ${partCols.map((c) => `${c} = ?`).join(', ')} WHERE id = ?`,
+      ).run(...partCols.map((c) => plan.part[c]), part.id);
     }
     if (plan.video) upsertStream(db, part, VIDEO, plan.video);
     if (plan.audio) upsertStream(db, part, AUDIO, plan.audio);

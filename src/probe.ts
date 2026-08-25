@@ -66,7 +66,7 @@ export async function probeMedia(realUrl: string, userAgent?: string): Promise<P
 
     const mediaInfo = await getMediaInfo();
     const result = await analyzeExclusive(() => mediaInfo.analyzeData(size, readChunk));
-    return mapResult(result);
+    return { ...mapResult(result), sizeBytes: size };
   } catch {
     return null;
   } finally {
@@ -119,6 +119,13 @@ function mapResult(result: {
   const out: ParsedMedia = {};
 
   if (general?.Format) out.container = mapContainer(general.Format);
+
+  const durationSec = Number(general?.Duration);
+  if (Number.isFinite(durationSec) && durationSec > 0) {
+    out.durationMs = Math.round(durationSec * 1000);
+  }
+  const overallBitrate = toInt(general?.OverallBitRate);
+  if (overallBitrate) out.bitrate = overallBitrate;
 
   if (video) {
     out.videoCodec = normaliseVideoCodec(video.Format);

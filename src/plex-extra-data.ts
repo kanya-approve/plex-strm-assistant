@@ -16,6 +16,9 @@ export interface ParsedMedia {
   audioChannels?: number;
   container?: string;
   videoProfile?: string;
+  durationMs?: number;
+  bitrate?: number;
+  sizeBytes?: number;
 
   colorTrc?: string;
   colorPrimaries?: string;

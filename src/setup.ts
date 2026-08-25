@@ -58,7 +58,8 @@ const likePattern = `${opts.containerPrefix}/%.strm`;
 // survives the rescans that re-fire this trigger. The media_items update runs
 // first so it only forces codecs while we are the ones supplying the data.
 const streamInfoSql = `
-  UPDATE media_items SET video_codec = 'h264', audio_codec = 'aac', container = 'mp4'
+  UPDATE media_items SET video_codec = 'h264', audio_codec = 'aac', container = 'mp4',
+    audio_channels = COALESCE(audio_channels, 2)
   WHERE id = NEW.media_item_id
     AND NOT EXISTS (
       SELECT 1 FROM media_streams
@@ -151,7 +152,8 @@ const seedAudioSql = `
 
 // Only force codecs on items Plex has no video stream for, so real analysis results stand.
 const seedMediaItemsSql = `
-  UPDATE media_items SET video_codec = 'h264', audio_codec = 'aac', container = 'mp4'
+  UPDATE media_items SET video_codec = 'h264', audio_codec = 'aac', container = 'mp4',
+    audio_channels = COALESCE(audio_channels, 2)
   WHERE id IN (
     SELECT DISTINCT mp.media_item_id FROM media_parts mp
     WHERE mp.file LIKE '${opts.proxyBase.replace(/\/$/, '')}%'
@@ -160,8 +162,27 @@ const seedMediaItemsSql = `
         SELECT 1 FROM media_streams ms
         WHERE ms.media_part_id = mp.id AND ms.stream_type_id = 1))`;
 
+// Plex reads media_items.audio_channels without a null check when building a
+// show's or season's preferences, and 500s the whole details view if it is NULL.
+// .strm items are never analysed, so seed the same stereo default the placeholder
+// aac stream already uses; real values overwrite it once metadata is written.
+const backfillAudioChannelsSql = `
+  UPDATE media_items SET audio_channels = COALESCE(
+    (SELECT ms.channels FROM media_streams ms
+      WHERE ms.media_item_id = media_items.id AND ms.stream_type_id = 2
+        AND ms.channels IS NOT NULL
+      ORDER BY ms."index" LIMIT 1), 2)
+  WHERE audio_channels IS NULL
+    AND id IN (
+      SELECT mp.media_item_id FROM media_parts mp
+      WHERE mp.file LIKE '${opts.proxyBase.replace(/\/$/, '')}%' AND mp.deleted_at IS NULL)`;
+
 // Runs before the stream seeds, which would otherwise satisfy its NOT EXISTS guard.
 const itemsUpdated = db.prepare(seedMediaItemsSql).run();
+const channelsBackfilled = db.prepare(backfillAudioChannelsSql).run();
+if (channelsBackfilled.changes > 0) {
+  console.log(`Seeded audio_channels for ${channelsBackfilled.changes} item(s).`);
+}
 db.exec(seedStreamsSql);
 db.exec(seedAudioSql);
 if (itemsUpdated.changes > 0) {
