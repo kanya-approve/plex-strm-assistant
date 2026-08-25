@@ -249,7 +249,7 @@ function upsertStream(db: DatabaseSync, part: StrmPart, streamType: number, s: S
       `UPDATE media_streams
        SET codec = COALESCE(?, codec),
            channels = COALESCE(?, channels),
-           language = COALESCE(?, language),
+           language = COALESCE(?, language, ''),
            extra_data = COALESCE(?, extra_data),
            updated_at = strftime('%s','now')
        WHERE media_part_id = ? AND stream_type_id = ? AND "index" = ?`,
@@ -273,7 +273,7 @@ function upsertStream(db: DatabaseSync, part: StrmPart, streamType: number, s: S
         part.id,
         s.codec ?? null,
         s.channels ?? null,
-        s.language ?? null,
+        s.language ?? (streamType === AUDIO ? '' : null),
         s.index,
         mergedExtra,
       );
