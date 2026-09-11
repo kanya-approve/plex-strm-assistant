@@ -16,9 +16,12 @@
  *
  * The Plex database is opened read-only, so it is safe while Plex runs.
  */
+import crypto from 'crypto';
 import fs from 'fs';
 import http from 'http';
+import https from 'https';
 import net from 'net';
+import tls from 'tls';
 import path from 'path';
 import { Readable } from 'node:stream';
 import { normaliseStrmUrl, resolveRedirects, strmPathFromUrlPath } from './strm';
@@ -27,11 +30,17 @@ import { trackedDb } from './db';
 const STRM_ROOT = path.resolve(process.env.STRM_ROOT ?? '/strm');
 const GATEWAY_PORT = Number(process.env.GATEWAY_PORT ?? 32500);
 const PLEX_UPSTREAM = new URL(process.env.PLEX_UPSTREAM ?? 'http://plex:32400');
+const UPSTREAM_IS_HTTPS = PLEX_UPSTREAM.protocol === 'https:';
+const UPSTREAM_PORT = Number(PLEX_UPSTREAM.port || (UPSTREAM_IS_HTTPS ? 443 : 80));
 const FOLLOW_REDIRECTS = process.env.FOLLOW_REDIRECTS === 'true';
 const DIRECT_STREAM = process.env.GATEWAY_MODE === 'direct-stream';
 const DB_PATH =
   process.env.DB_PATH ??
   '/plex-config/Library/Application Support/Plex Media Server/Plug-in Support/Databases/com.plexapp.plugins.library.db';
+
+const GATEWAY_TLS = process.env.GATEWAY_TLS === 'true';
+// <config dir>/Plug-in Support/Databases/<db> -> the DB sits two levels down.
+const PLEX_CONFIG_DIR = path.resolve(path.dirname(DB_PATH), '../..');
 
 // Direct-play media part URL, e.g. /library/parts/6/1751700000/file.mp4
 const PART_PATH_RE = /^\/library\/parts\/(\d+)\/\d+\/file(?:\.\w+)?$/;
@@ -281,7 +290,7 @@ function proxyThrough(
   res: http.ServerResponse,
   urlOverride?: string,
 ): void {
-  const upstreamReq = http.request(
+  const upstreamReq = (UPSTREAM_IS_HTTPS ? https : http).request(
     upstreamUrl(urlOverride ?? req.url ?? '/'),
     {
       method: req.method,
@@ -299,7 +308,30 @@ function proxyThrough(
   req.pipe(upstreamReq);
 }
 
-const server = http.createServer(async (req, res) => {
+function resolveCertPath(): string {
+  const cacheDir = path.join(PLEX_CONFIG_DIR, 'Cache');
+  const preferred = path.join(cacheDir, 'cert-v2.p12');
+  if (fs.existsSync(preferred)) return preferred;
+  const found = fs.readdirSync(cacheDir).find((f) => f.endsWith('.p12'));
+  if (!found) throw new Error(`no .p12 cert found in ${cacheDir}`);
+  return path.join(cacheDir, found);
+}
+
+// Passphrase is SHA512("plex" + ProcessedMachineIdentifier) -- Plex's own scheme.
+function loadPlexTls(): { pfx: Buffer; passphrase: string } {
+  const prefs = fs.readFileSync(path.join(PLEX_CONFIG_DIR, 'Preferences.xml'), 'utf-8');
+  const id = /ProcessedMachineIdentifier="([^"]+)"/.exec(prefs)?.[1];
+  if (!id) throw new Error('ProcessedMachineIdentifier missing from Preferences.xml');
+  const passphrase = crypto.createHash('sha512').update('plex' + id).digest('hex');
+  const pfx = fs.readFileSync(resolveCertPath());
+  tls.createSecureContext({ pfx, passphrase });
+  return { pfx, passphrase };
+}
+
+const handleRequest = async (
+  req: http.IncomingMessage,
+  res: http.ServerResponse,
+): Promise<void> => {
   try {
     const urlPath = (req.url ?? '/').split(/[?#]/)[0];
     const partMatch =
@@ -347,11 +379,35 @@ const server = http.createServer(async (req, res) => {
     console.error(`error handling ${req.url}: ${(err as Error).message}`);
     if (!res.headersSent) res.writeHead(500).end('Internal error');
   }
-});
+};
+
+function buildServer(): http.Server {
+  if (!GATEWAY_TLS) return http.createServer(handleRequest);
+  let tlsOpts: { pfx: Buffer; passphrase: string };
+  try {
+    tlsOpts = loadPlexTls();
+  } catch (err) {
+    console.error(`FATAL: cannot load Plex TLS cert: ${(err as Error).message}`);
+    console.error('Fix the Plex config mount, or set GATEWAY_TLS=false to run over plain HTTP.');
+    process.exit(1);
+  }
+  const s = https.createServer(tlsOpts, handleRequest);
+  // Plex renews the cert (~90d); reload so we present the current one.
+  setInterval(() => {
+    try {
+      s.setSecureContext(loadPlexTls());
+    } catch (err) {
+      console.warn(`gateway: TLS cert reload failed: ${(err as Error).message}`);
+    }
+  }, 21_600_000).unref();
+  return s;
+}
+
+const server = buildServer();
 
 // Plex clients use websockets (/:/websockets) -- tunnel upgrades to PMS raw
 server.on('upgrade', (req, socket, head) => {
-  const upstream = net.connect(Number(PLEX_UPSTREAM.port || 80), PLEX_UPSTREAM.hostname, () => {
+  const relay = (): void => {
     let rawHead = `${req.method} ${req.url} HTTP/1.1\r\n`;
     for (let i = 0; i < req.rawHeaders.length; i += 2) {
       const name = req.rawHeaders[i];
@@ -361,14 +417,19 @@ server.on('upgrade', (req, socket, head) => {
     upstream.write(rawHead + '\r\n');
     if (head.length) upstream.write(head);
     socket.pipe(upstream).pipe(socket);
-  });
+  };
+  // Match the upstream scheme -- a plaintext socket to an https PMS would hang.
+  const upstream = UPSTREAM_IS_HTTPS
+    ? tls.connect(UPSTREAM_PORT, PLEX_UPSTREAM.hostname, { servername: PLEX_UPSTREAM.hostname }, relay)
+    : net.connect(UPSTREAM_PORT, PLEX_UPSTREAM.hostname, relay);
   upstream.on('error', () => socket.destroy());
   socket.on('error', () => upstream.destroy());
 });
 
+const scheme = GATEWAY_TLS ? 'https' : 'http';
 server.listen(GATEWAY_PORT, () =>
   console.log(
-    `strm-gateway on :${GATEWAY_PORT}  ->  ${PLEX_UPSTREAM.href}  [${DIRECT_STREAM ? 'direct-stream' : 'direct-play'}]` +
+    `strm-gateway on ${scheme}://:${GATEWAY_PORT}  ->  ${PLEX_UPSTREAM.href}  [${DIRECT_STREAM ? 'direct-stream' : 'direct-play'}]` +
       (FOLLOW_REDIRECTS ? '  (following upstream redirects)' : ''),
   ),
 );
