@@ -183,6 +183,12 @@ async function directUrlForPart(
   return FOLLOW_REDIRECTS ? resolveRedirects(url, userAgent) : url;
 }
 
+/** Only the path is taken from the request: a target like "//host/x" would
+ *  otherwise resolve to a host of the caller's choosing (an open proxy). */
+function upstreamUrl(target: string): URL {
+  return new URL('/' + target.replace(/^[/\\]+/, ''), PLEX_UPSTREAM);
+}
+
 /** Streams a request through to PMS, optionally with a rewritten path+query. */
 function proxyThrough(
   req: http.IncomingMessage,
@@ -190,7 +196,7 @@ function proxyThrough(
   urlOverride?: string,
 ): void {
   const upstreamReq = http.request(
-    new URL(urlOverride ?? req.url ?? '/', PLEX_UPSTREAM),
+    upstreamUrl(urlOverride ?? req.url ?? '/'),
     {
       method: req.method,
       headers: { ...req.headers, host: PLEX_UPSTREAM.host },
