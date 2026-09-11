@@ -10,6 +10,9 @@ import {
 
 const PROBE_TIMEOUT_MS = Number(process.env.PROBE_TIMEOUT_MS ?? 20000);
 const PROBE_MAX_BYTES = Number(process.env.PROBE_MAX_BYTES ?? 32 * 1024 * 1024);
+// One round trip per chunk, and remote sources are latency-bound: at the 256 KiB
+// default the time budget runs out after a handful of reads.
+const CHUNK_SIZE = 1024 * 1024;
 
 let mediaInfoPromise: Promise<MediaInfo<'object'>> | undefined;
 
@@ -17,6 +20,7 @@ function getMediaInfo(): Promise<MediaInfo<'object'>> {
   if (!mediaInfoPromise) {
     mediaInfoPromise = mediaInfoFactory({
       format: 'object',
+      chunkSize: CHUNK_SIZE,
       locateFile: () => require.resolve('mediainfo.js/MediaInfoModule.wasm'),
     }).catch((err) => {
       mediaInfoPromise = undefined;
@@ -61,20 +65,31 @@ export async function probeMedia(realUrl: string, userAgent?: string): Promise<P
     clearTimeout(timer);
     if (!size) return null;
 
+    // mediainfo reads far past the headers to fill in statistics we don't use. When
+    // the budget runs out, report end-of-file so it finalizes with what it parsed;
+    // throwing here would discard the whole analysis.
     const readChunk = async (chunkSize: number, offset: number): Promise<Uint8Array> => {
-      if (bytesRead >= PROBE_MAX_BYTES) throw new Error('probe byte budget exceeded');
-      const res = await fetch(realUrl, {
-        // Forward the caller's UA: redirector services (e.g. 115) bind the
-        // resolved URL to the agent that requested it, so a bare probe 403s.
-        headers: { Range: `bytes=${offset}-${offset + chunkSize - 1}`, ...uaHeaders(userAgent) },
-        signal: controller.signal,
-        redirect: 'follow',
-      });
-      // A 200 would stream the whole file instead of the requested range.
-      if (res.status !== 206) throw new Error(`range not honoured (status ${res.status})`);
-      const chunk = new Uint8Array(await res.arrayBuffer());
-      bytesRead += chunk.byteLength;
-      return chunk;
+      // mediainfo asks for 0 bytes at end-of-file; as a Range header that's
+      // "bytes=N-(N-1)", which real servers reject with a 416.
+      if (chunkSize <= 0) return new Uint8Array(0);
+      if (controller.signal.aborted || bytesRead >= PROBE_MAX_BYTES) return new Uint8Array(0);
+      try {
+        const res = await fetch(realUrl, {
+          // Forward the caller's UA: redirector services (e.g. 115) bind the
+          // resolved URL to the agent that requested it, so a bare probe 403s.
+          headers: { Range: `bytes=${offset}-${offset + chunkSize - 1}`, ...uaHeaders(userAgent) },
+          signal: controller.signal,
+          redirect: 'follow',
+        });
+        // A 200 would stream the whole file instead of the requested range.
+        if (res.status !== 206) throw new Error(`range not honoured (status ${res.status})`);
+        const chunk = new Uint8Array(await res.arrayBuffer());
+        bytesRead += chunk.byteLength;
+        return chunk;
+      } catch (err) {
+        if (controller.signal.aborted) return new Uint8Array(0);
+        throw err;
+      }
     };
 
     const mediaInfo = await getMediaInfo();
@@ -82,7 +97,10 @@ export async function probeMedia(realUrl: string, userAgent?: string): Promise<P
       armDeadline();
       return mediaInfo.analyzeData(size, readChunk);
     });
-    return { ...mapResult(result), sizeBytes: size };
+    const parsed = mapResult(result);
+    // Out of budget before the headers arrived: nothing worth marking the part probed for.
+    if (!parsed.videoCodec && !parsed.audioCodec) return null;
+    return { ...parsed, sizeBytes: size };
   } catch {
     return null;
   } finally {
