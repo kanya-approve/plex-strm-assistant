@@ -16,6 +16,7 @@ import fs from 'fs';
 import http from 'http';
 import net from 'net';
 import path from 'path';
+import type { Duplex } from 'node:stream';
 import { normaliseStrmUrl, resolveRedirects, strmPathFromUrlPath } from './strm';
 import { trackedDb } from './db';
 
@@ -256,8 +257,12 @@ const server = http.createServer(async (req, res) => {
   }
 });
 
+const tunnels = new Set<Duplex>();
+
 // Plex clients use websockets (/:/websockets) -- tunnel upgrades to PMS raw
 server.on('upgrade', (req, socket, head) => {
+  tunnels.add(socket);
+  socket.on('close', () => tunnels.delete(socket));
   const upstream = net.connect(Number(PLEX_UPSTREAM.port || 80), PLEX_UPSTREAM.hostname, () => {
     let rawHead = `${req.method} ${req.url} HTTP/1.1\r\n`;
     for (let i = 0; i < req.rawHeaders.length; i += 2) {
@@ -279,3 +284,15 @@ server.listen(GATEWAY_PORT, () =>
       (FOLLOW_REDIRECTS ? '  (following upstream redirects)' : ''),
   ),
 );
+
+for (const sig of ['SIGTERM', 'SIGINT'] as const) {
+  process.on(sig, () => {
+    server.close(() => {
+      readDb.close();
+      process.exit(0);
+    });
+    // close() waits for every open connection, including relays and websocket tunnels.
+    server.closeAllConnections();
+    for (const socket of tunnels) socket.destroy();
+  });
+}
