@@ -34,6 +34,7 @@ const UPSTREAM_IS_HTTPS = PLEX_UPSTREAM.protocol === 'https:';
 const UPSTREAM_PORT = Number(PLEX_UPSTREAM.port || (UPSTREAM_IS_HTTPS ? 443 : 80));
 const FOLLOW_REDIRECTS = process.env.FOLLOW_REDIRECTS === 'true';
 const DIRECT_STREAM = process.env.GATEWAY_MODE === 'direct-stream';
+const ANALYZE_ON_PLAY = process.env.ANALYZE_ON_PLAY === 'true';
 const DB_PATH =
   process.env.DB_PATH ??
   '/plex-config/Library/Application Support/Plex Media Server/Plug-in Support/Databases/com.plexapp.plugins.library.db';
@@ -143,6 +144,15 @@ function metadataHasStrmPart(metadataId: string): boolean {
   }
 }
 
+function decisionMetadataId(rawUrl: string): string | undefined {
+  try {
+    const target = new URL(rawUrl, 'http://gateway').searchParams.get('path') ?? '';
+    return /^\/library\/metadata\/(\d+)$/.exec(target)?.[1];
+  } catch {
+    return undefined;
+  }
+}
+
 /**
  * Rewrites a transcode decision URL for a .strm item -- to Direct Play, or to
  * Direct Stream in direct-stream mode. Returns the rewritten path+query, or null
@@ -203,6 +213,50 @@ async function directUrlForPart(
   if (!url) return null;
 
   return FOLLOW_REDIRECTS ? resolveRedirects(url, userAgent) : url;
+}
+
+/** True while a .strm item has never been analysed: only an analysis records a part's duration. */
+function isUnanalysedStrm(metadataId: string): boolean {
+  try {
+    const db = readDb.get();
+    if (!db) return false;
+    const rows = db
+      .prepare(
+        `SELECT mp.file FROM media_parts mp
+         JOIN media_items mi ON mp.media_item_id = mi.id
+         WHERE mi.metadata_item_id = ? AND mp.deleted_at IS NULL AND IFNULL(mp.duration, 0) = 0`,
+      )
+      .all(metadataId) as { file: string }[];
+    return rows.some((row) => row.file != null && strmPathForStored(row.file) !== null);
+  } catch (err) {
+    console.warn(`db lookup failed: ${(err as Error).message}`);
+    readDb.close();
+    return false;
+  }
+}
+
+// Triggered by the decision request, which every client sends before playing: in
+// direct-stream mode no part request follows, since PMS reads the file itself.
+const analyzeRequested = new Set<string>();
+async function analyzeOnPlay(metadataId: string): Promise<void> {
+  if (!ANALYZE_ON_PLAY || analyzeRequested.has(metadataId) || !isUnanalysedStrm(metadataId)) return;
+  analyzeRequested.add(metadataId);
+  try {
+    // The server's own token: the playing user's may not be allowed to trigger analysis.
+    const token = plexPreference('PlexOnlineToken');
+    if (!token) throw new Error('PlexOnlineToken missing from Preferences.xml');
+    const res = await fetch(new URL(`/library/metadata/${metadataId}/analyze`, PLEX_UPSTREAM), {
+      method: 'PUT',
+      headers: { 'X-Plex-Token': token },
+      signal: AbortSignal.timeout(60_000),
+    });
+    await res.body?.cancel();
+    if (!res.ok) throw new Error(`PMS answered ${res.status}`);
+    console.log(`analyze  metadata ${metadataId}`);
+  } catch (err) {
+    analyzeRequested.delete(metadataId);
+    console.warn(`analyze-on-play failed for metadata ${metadataId}: ${(err as Error).message}`);
+  }
 }
 
 const RELAY_HEADERS = [
@@ -310,10 +364,14 @@ function resolveCertPath(): string {
   return path.join(cacheDir, found);
 }
 
+function plexPreference(name: string): string | undefined {
+  const prefs = fs.readFileSync(path.join(PLEX_CONFIG_DIR, 'Preferences.xml'), 'utf-8');
+  return new RegExp(`${name}="([^"]+)"`).exec(prefs)?.[1];
+}
+
 // Same passphrase derivation PMS uses for its own cert.
 function loadPlexTls(): { pfx: Buffer; passphrase: string } {
-  const prefs = fs.readFileSync(path.join(PLEX_CONFIG_DIR, 'Preferences.xml'), 'utf-8');
-  const id = /ProcessedMachineIdentifier="([^"]+)"/.exec(prefs)?.[1];
+  const id = plexPreference('ProcessedMachineIdentifier');
   if (!id) throw new Error('ProcessedMachineIdentifier missing from Preferences.xml');
   const passphrase = crypto.createHash('sha512').update('plex' + id).digest('hex');
   const pfx = fs.readFileSync(resolveCertPath());
@@ -352,6 +410,8 @@ const handleRequest = async (
     }
 
     if (req.method === 'GET' && urlPath === DECISION_PATH) {
+      const metadataId = decisionMetadataId(req.url ?? '/');
+      if (metadataId) void analyzeOnPlay(metadataId);
       const productHeader = req.headers['x-plex-product'];
       const rewritten = rewriteStrmDecision(
         req.url ?? '/',
@@ -425,7 +485,8 @@ const scheme = GATEWAY_TLS ? 'https' : 'http';
 server.listen(GATEWAY_PORT, () =>
   console.log(
     `strm-gateway on ${scheme}://:${GATEWAY_PORT}  ->  ${PLEX_UPSTREAM.href}  [${DIRECT_STREAM ? 'direct-stream' : 'direct-play'}]` +
-      (FOLLOW_REDIRECTS ? '  (following upstream redirects)' : ''),
+      (FOLLOW_REDIRECTS ? '  (following upstream redirects)' : '') +
+      (ANALYZE_ON_PLAY ? '  (analyze on play)' : ''),
   ),
 );
 
