@@ -157,9 +157,44 @@ All variables are optional. The defaults match the Quick start layout, so you on
 | `SKIP_SETUP`             | `false`                                                                                                               | Set to `true` to skip trigger installation (safe while Plex is running)                                                                                                           |
 | `FOLLOW_REDIRECTS`       | `false`                                                                                                               | Set to `true` to resolve the source URL's redirect chain server-side and return the final URL to Plex. Needed for services where the `.strm` URL is a redirector (e.g. 115 Drive) |
 | `GATEWAY_ENABLED`        | `false`                                                                                                               | Set to `true` to start the direct streaming gateway alongside the proxy                                                                                                           |
+| `GATEWAY_MODE`           | `direct-play`                                                                                                         | `direct-play`: client fetches the source (302). `direct-stream`: gateway relays the source bytes for in-cluster/private sources (see [gateway](#direct-streaming-gateway-source---client-bypassing-plex)) |
 | `GATEWAY_PORT`           | `32500`                                                                                                               | Port the gateway listens on                                                                                                                                                       |
 | `PLEX_UPSTREAM`          | `http://plex:32400`                                                                                                   | Plex Media Server address the gateway forwards to                                                                                                                                 |
 | `GATEWAY_VALIDATE_TOKEN` | `true`                                                                                                                | Validate the `X-Plex-Token` against Plex before redirecting media part requests. Set to `false` only on LAN-only setups                                                           |
+| `WRITE_METADATA`         | `false`                                                                                                               | Set to `true` to let the proxy write real Media Info into the Plex DB on play (see [Real media metadata](#real-media-metadata)). Off by default                                    |
+| `PROBE_TIMEOUT_MS`       | `20000`                                                                                                               | Max time for the play-time media probe (see [Real media metadata](#real-media-metadata))                                                                                         |
+| `PROBE_MAX_BYTES`        | `33554432`                                                                                                           | Max bytes the probe may read from the source (header regions only, via HTTP Range)                                                                                               |
+
+---
+
+## Real media metadata
+
+Because a `.strm` has no local media for Plex to analyse, Plex normally shows wrong Media Info
+(the placeholder H.264/AAC the triggers seed to force direct play). Optionally, this tool can
+replace that with **real** codec, resolution, HDR/Dolby Vision, bit depth, audio codec and
+channel info.
+
+> **Opt-in.** This is off by default. Enable it by setting `WRITE_METADATA=true` on the proxy
+> (for the on-play probe) and/or passing `--write-metadata` to the CLI patcher (for the
+> filename pass during a scan). With it off, the proxy never opens or writes to the Plex DB.
+
+It draws from two sources:
+
+- **Filenames** — Sonarr/Radarr encode the details into the name (e.g.
+  `... - S01E12 - Title [Bluray-1080p][HDR][DTS 5.1][x265]-GROUP.strm`). These are parsed with
+  [`@viren070/parse-torrent-title`](https://github.com/Viren070/parse-torrent-title) (the parser
+  the Riven RTN package is built on) during the patch/scan and on first play. Unparseable or
+  empty tokens are simply skipped.
+- **The actual stream, on first play** — Plex cannot probe remote parts, so the proxy analyses
+  the resolved stream itself using [`mediainfo.js`](https://github.com/buzz/mediainfo.js) (a
+  WebAssembly build of MediaInfo — no external binary). It reads only the header bytes over HTTP
+  Range requests and writes the ground truth, correcting anything the filename missed. If the
+  source doesn't support Range requests the probe is skipped and the filename data stands.
+
+Writes are idempotent and self-healing: they only touch the DB when values differ, and restore
+the real metadata if a Plex rescan reverts it. Only Media Info is written — titles and matching
+are left to Plex. Requires `DB_PATH` to point at the Plex database (the default Compose layout).
+Codecs are now reported truthfully, so a client may choose to transcode.
 
 ---
 
@@ -221,12 +256,21 @@ Default:        source (e.g. 115 CDN) -> Plex server -> client
 Gateway mode:   source (e.g. 115 CDN) ---------------> client
 ```
 
-Gateway mode removes the Plex server from the media path, similar to what [MediaWarp](https://github.com/AkimioJR/MediaWarp) does for Emby and Jellyfin. The gateway is a reverse proxy that sits in front of Plex: clients connect to it instead of the Plex port. All requests (browsing, metadata, transcoding, websockets) pass through to Plex untouched. Only two request types for `.strm` items are intercepted:
+The gateway is a reverse proxy that sits in front of Plex: clients connect to it instead of the Plex port. All requests (browsing, metadata, transcoding, websockets) pass through to Plex untouched. Only two request types for `.strm` items are intercepted, and how they're handled depends on `GATEWAY_MODE`:
 
-- **Media part requests** (direct play): the gateway resolves the final source URL and answers with a `302` that the client follows, so video flows straight from the source once playback starts.
-- **Transcode decision requests**: when a client asks Plex how to play a `.strm` item, the gateway rewrites the request to force direct play before it reaches Plex: client quality caps are stripped and burned-in subtitles are switched to separate delivery. This coerces clients that would otherwise transcode into direct playing. Plex Web is exempt: browsers block cross-origin media fetches (CORS), so web clients fall back to Direct Stream through the Plex server instead.
+**`direct-play` (default)** — removes the Plex server from the media path (similar to what [MediaWarp](https://github.com/AkimioJR/MediaWarp) does for Emby/Jellyfin). Use when the source is reachable by your clients (e.g. a public CDN).
 
-The gateway reads the Plex database in read-only mode, so it is safe while Plex is running and needs no extra setup step.
+- **Media part requests**: the gateway resolves the final source URL and answers with a `302` the client follows, so video flows straight from the source.
+- **Transcode decision requests**: rewritten to force Direct Play (quality caps stripped, burned-in subtitles switched to separate delivery), coercing clients that would otherwise transcode into direct playing.
+
+**`direct-stream`** — the gateway **relays the source bytes itself** (Range-aware), so an off-network client never has to reach the source. Use when the source is only reachable in-cluster / on a private network (e.g. `http://…svc.cluster.local`, or the in-pod proxy). Requires `WRITE_METADATA` is irrelevant to this — it works with either fake or real Media Info.
+
+- **Media part requests**: the gateway streams the source through itself instead of 302-ing.
+- **Transcode decision requests**: rewritten to Direct Stream (`directPlay=0`, `directStream=1`) so Plex also relays via its own transcode session where clients use that path.
+
+In both modes, Plex Web is exempt (browsers block cross-origin media fetches via CORS and already fall back to Direct Stream through Plex), and non-`.strm` items pass straight through. The gateway reads the Plex database read-only, so it is safe while Plex runs and needs no extra setup step.
+
+> **Which mode?** If your `.strm` URLs point at something your phone/TV can reach directly → `direct-play`. If they point at an in-cluster/private source only the server can reach (the classic "works on web, fails in the app with connection refused" case) → `direct-stream`. Clients must be pointed at the gateway either way, or nothing is intercepted.
 
 ### 1. Enable the gateway
 
@@ -240,6 +284,8 @@ services:
     environment:
       - SKIP_SETUP=${SKIP_SETUP:-false}
       - GATEWAY_ENABLED=true
+      # direct-play (default) or direct-stream (relay in-cluster/private sources)
+      - GATEWAY_MODE=direct-play
       # Resolve redirector URLs (e.g. 115) per play request, bound to the client
       - FOLLOW_REDIRECTS=true
     volumes:
@@ -274,6 +320,17 @@ Clients must reach Plex through port `32500` instead of `32400`:
 - **Plex apps (recommended):** in Plex, open **Settings > Network > Custom server access URLs** and add `http://<your-host>:32500`. Apps that discover the server through your Plex account will then connect via the gateway automatically.
 
 Use a hostname or IP that your clients can reach on your network, not `localhost`.
+
+### Secure connections (`app.plex.tv`)
+
+`app.plex.tv` is served over HTTPS and refuses an insecure server connection, so a plain-HTTP gateway triggers _"unable to connect securely."_ Set `GATEWAY_TLS=true` and the gateway serves the client side with Plex's own `plex.direct` certificate — read from the shared Plex config volume — so `app.plex.tv` validates it exactly as it would the real server. The cert is reloaded automatically when Plex renews it.
+
+`GATEWAY_TLS`:
+
+- `false` (default) — plain HTTP.
+- `true` — HTTPS with Plex's `plex.direct` cert. **The gateway exits on startup if the cert can't be loaded** (bad config mount, or Plex hasn't generated its cert yet).
+
+For HTTPS, route the address Plex advertises for secure connections — its `plex.direct` host on port `32400` — to the gateway (external `:32400` → gateway). The Plex config volume must be mounted into the proxy container (it already is, for DB access); the cert is found relative to `DB_PATH`.
 
 ### 4. Verify it works
 
@@ -334,13 +391,20 @@ rm -f "${DB}-wal" "${DB}-shm"
 - [x] HTTP proxy that resolves `.strm` files to stream URLs via `302` redirect
 - [x] SQLite triggers to survive Plex rescans automatically
 - [x] Inject H.264/AAC codec metadata to force direct play (no transcoding)
+- [x] Write real Media Info (codec, resolution, HDR/Dolby Vision, audio) parsed from filenames and probed from the stream on first play (see [Real media metadata](#real-media-metadata))
 - [x] Docker container that installs triggers on start, then runs the proxy
 - [x] Multi-platform image (amd64, arm64)
 - [x] Safe first-run handling: waits for the Plex DB, `SKIP_SETUP` flag for restarts
 - [ ] Disable unnecessary Plex processing on `.strm` items (analysis, thumbnail generation, etc.)
-- [ ] Probe source URLs (ffprobe) to publish real audio and subtitle track metadata to Plex
 - [x] Follow 302 redirects from the source URL before returning to Plex (`FOLLOW_REDIRECTS=true`), enabling compatibility with services that require a redirect step (e.g. 115 Drive)
 - [x] Direct streaming gateway (`GATEWAY_ENABLED=true`): direct-play traffic goes straight from the source to the client, bypassing the Plex server (MediaWarp-style)
+- [x] Gateway `direct-stream` mode (`GATEWAY_MODE=direct-stream`): relay the source bytes through the gateway for sources only reachable in-cluster / on a private network
+
+---
+
+## Running from source
+
+The Docker image ships Node 26, and the published CLI targets **Node 24 or newer** (`engines` in `package.json`). On those versions `node:sqlite` is stable, so the npm scripts run it directly — the old `--experimental-sqlite` flag is no longer required. On older runtimes (Node 22 LTS) `node:sqlite` is still flagged and `npm start` / `npm run dev` will fail; upgrade Node rather than re-adding the flag.
 
 ---
 
