@@ -103,6 +103,22 @@ export function findPartByContainerPath(
   return null;
 }
 
+// The stored file is the proxy URL, raw from the setup trigger or percent-encoded
+// from the CLI patcher, so try both plus the original .strm container path.
+export function findPartByProxyPath(
+  db: DatabaseSync,
+  proxyBase: string,
+  containerPrefix: string,
+  decodedPath: string,
+): StrmPart | null {
+  const base = proxyBase.replace(/\/$/, '');
+  const rawUrl = base + decodedPath;
+  const encodedUrl = base + decodedPath.split('/').map(encodeURIComponent).join('/');
+  const strmContainer =
+    containerPrefix.replace(/\/$/, '') + decodedPath.replace(/\.[^./]+$/, '.strm');
+  return findPartByContainerPath(db, strmContainer, [rawUrl, encodedUrl]);
+}
+
 export function updatePartFile(
   db: DatabaseSync,
   part: StrmPart,
