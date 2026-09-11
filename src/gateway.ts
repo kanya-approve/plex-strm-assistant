@@ -34,6 +34,7 @@ const UPSTREAM_IS_HTTPS = PLEX_UPSTREAM.protocol === 'https:';
 const UPSTREAM_PORT = Number(PLEX_UPSTREAM.port || (UPSTREAM_IS_HTTPS ? 443 : 80));
 const FOLLOW_REDIRECTS = process.env.FOLLOW_REDIRECTS === 'true';
 const DIRECT_STREAM = process.env.GATEWAY_MODE === 'direct-stream';
+const ANALYZE_ON_PLAY = process.env.ANALYZE_ON_PLAY === 'true';
 const DB_PATH =
   process.env.DB_PATH ??
   '/plex-config/Library/Application Support/Plex Media Server/Plug-in Support/Databases/com.plexapp.plugins.library.db';
@@ -205,6 +206,52 @@ async function directUrlForPart(
   return FOLLOW_REDIRECTS ? resolveRedirects(url, userAgent) : url;
 }
 
+/** The part's metadata item while its media still has only the placeholder info the setup
+ *  triggers seed (they never set a width); null once Plex has analysed it. */
+function unanalysedMetadataId(partId: string): string | null {
+  try {
+    const db = readDb.get();
+    if (!db) return null;
+    const row = db
+      .prepare(
+        `SELECT mi.metadata_item_id AS id FROM media_parts mp
+         JOIN media_items mi ON mp.media_item_id = mi.id
+         WHERE mp.id = ? AND IFNULL(mi.width, 0) = 0`,
+      )
+      .get(partId) as { id: number } | undefined;
+    return row ? String(row.id) : null;
+  } catch (err) {
+    console.warn(`db lookup failed: ${(err as Error).message}`);
+    readDb.close();
+    return null;
+  }
+}
+
+// Only real playback reaches the part handler: Plex's analyser fetches through the proxy.
+const analyzeRequested = new Set<string>();
+async function analyzeOnPlay(partId: string): Promise<void> {
+  if (!ANALYZE_ON_PLAY || analyzeRequested.has(partId)) return;
+  const metadataId = unanalysedMetadataId(partId);
+  if (!metadataId) return;
+  analyzeRequested.add(partId);
+  try {
+    // The server's own token: the playing user's may not be allowed to trigger analysis.
+    const token = plexPreference('PlexOnlineToken');
+    if (!token) throw new Error('PlexOnlineToken missing from Preferences.xml');
+    const res = await fetch(new URL(`/library/metadata/${metadataId}/analyze`, PLEX_UPSTREAM), {
+      method: 'PUT',
+      headers: { 'X-Plex-Token': token },
+      signal: AbortSignal.timeout(60_000),
+    });
+    await res.body?.cancel();
+    if (!res.ok) throw new Error(`PMS answered ${res.status}`);
+    console.log(`analyze  part ${partId}  ->  metadata ${metadataId}`);
+  } catch (err) {
+    analyzeRequested.delete(partId);
+    console.warn(`analyze-on-play failed for part ${partId}: ${(err as Error).message}`);
+  }
+}
+
 const RELAY_HEADERS = [
   'content-type',
   'content-length',
@@ -310,10 +357,14 @@ function resolveCertPath(): string {
   return path.join(cacheDir, found);
 }
 
+function plexPreference(name: string): string | undefined {
+  const prefs = fs.readFileSync(path.join(PLEX_CONFIG_DIR, 'Preferences.xml'), 'utf-8');
+  return new RegExp(`${name}="([^"]+)"`).exec(prefs)?.[1];
+}
+
 // Same passphrase derivation PMS uses for its own cert.
 function loadPlexTls(): { pfx: Buffer; passphrase: string } {
-  const prefs = fs.readFileSync(path.join(PLEX_CONFIG_DIR, 'Preferences.xml'), 'utf-8');
-  const id = /ProcessedMachineIdentifier="([^"]+)"/.exec(prefs)?.[1];
+  const id = plexPreference('ProcessedMachineIdentifier');
   if (!id) throw new Error('ProcessedMachineIdentifier missing from Preferences.xml');
   const passphrase = crypto.createHash('sha512').update('plex' + id).digest('hex');
   const pfx = fs.readFileSync(resolveCertPath());
@@ -336,6 +387,7 @@ const handleRequest = async (
       if (!VALIDATE_TOKEN || (await isValidToken(tokenFromRequest(req)))) {
         const target = await directUrlForPart(partMatch[1], req.headers['user-agent']);
         if (target) {
+          void analyzeOnPlay(partMatch[1]);
           // Browsers can't follow a cross-origin 302 (CORS), so they get relayed too.
           if (DIRECT_STREAM || isBrowserRequest(req)) {
             console.log(`relay  part ${partMatch[1]}  ->  ${target}`);
@@ -421,7 +473,8 @@ const scheme = GATEWAY_TLS ? 'https' : 'http';
 server.listen(GATEWAY_PORT, () =>
   console.log(
     `strm-gateway on ${scheme}://:${GATEWAY_PORT}  ->  ${PLEX_UPSTREAM.href}  [${DIRECT_STREAM ? 'direct-stream' : 'direct-play'}]` +
-      (FOLLOW_REDIRECTS ? '  (following upstream redirects)' : ''),
+      (FOLLOW_REDIRECTS ? '  (following upstream redirects)' : '') +
+      (ANALYZE_ON_PLAY ? '  (analyze on play)' : ''),
   ),
 );
 
