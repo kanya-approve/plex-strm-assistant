@@ -36,12 +36,35 @@ else
     --proxy-base "$PROXY_BASE"
 fi
 
-# Gateway mode: reverse proxy in front of PMS that 302s direct-play .strm
-# requests straight to the source, so streaming bypasses PMS entirely
-if [ "${GATEWAY_ENABLED:-false}" = "true" ]; then
-  echo "[strm-proxy] Starting gateway..."
-  node /app/dist/gateway.js &
+if [ "${GATEWAY_ENABLED:-false}" != "true" ]; then
+  echo "[strm-proxy] Starting proxy..."
+  exec node /app/dist/proxy.js
 fi
 
+# Gateway mode: reverse proxy in front of PMS that 302s direct-play .strm
+# requests straight to the source, so streaming bypasses PMS entirely
+echo "[strm-proxy] Starting gateway..."
+node /app/dist/gateway.js &
+gateway_pid=$!
+
 echo "[strm-proxy] Starting proxy..."
-exec node /app/dist/proxy.js
+node /app/dist/proxy.js &
+proxy_pid=$!
+
+stopping=""
+trap 'stopping=1; kill -TERM "$gateway_pid" "$proxy_pid" 2>/dev/null || true' TERM INT
+
+while :; do
+  for pid in "$gateway_pid" "$proxy_pid"; do
+    if ! kill -0 "$pid" 2>/dev/null; then
+      [ -n "$stopping" ] || echo "[strm-proxy] pid $pid exited -- stopping the container"
+      kill -TERM "$gateway_pid" "$proxy_pid" 2>/dev/null || true
+      wait || true
+      [ -n "$stopping" ] || exit 1
+      exit 0
+    fi
+  done
+  # Unlike sleep, wait is interrupted by a trapped signal.
+  sleep 2 &
+  wait $! || true
+done
