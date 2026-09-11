@@ -10,6 +10,7 @@ export type StrmPart = {
   mediaItemId: number;
   extraData: string | null;
   strmSource: string | null;
+  probed: boolean;
 };
 
 export type UpdateOutcome = {
@@ -119,6 +120,16 @@ export function findPartByProxyPath(
   return findPartByContainerPath(db, strmContainer, [rawUrl, encodedUrl]);
 }
 
+export function findPartById(db: DatabaseSync, id: string | number): StrmPart | null {
+  const raw = db
+    .prepare(
+      `SELECT id, file, size, media_item_id AS mediaItemId, extra_data AS extraData
+       FROM media_parts WHERE id = ?`,
+    )
+    .get(id) as RawPart | undefined;
+  return raw ? toStrmPart(raw) : null;
+}
+
 export function updatePartFile(
   db: DatabaseSync,
   part: StrmPart,
@@ -150,10 +161,14 @@ export function updatePartFile(
 
 // -- types & helpers --
 
-type RawPart = Omit<StrmPart, 'strmSource'> & { extraData: string | null };
+type RawPart = Omit<StrmPart, 'strmSource' | 'probed'> & { extraData: string | null };
 
 function toStrmPart(raw: RawPart): StrmPart {
-  return { ...raw, strmSource: parseStrmSource(raw.extraData) };
+  return {
+    ...raw,
+    strmSource: parseStrmSource(raw.extraData),
+    probed: parseProbedFlag(raw.extraData),
+  };
 }
 
 function parseStrmSource(extraData: string | null): string | null {
@@ -165,6 +180,30 @@ function parseStrmSource(extraData: string | null): string | null {
   } catch {
     return null;
   }
+}
+
+function parseProbedFlag(extraData: string | null): boolean {
+  if (!extraData) return false;
+  try {
+    const obj = JSON.parse(extraData) as Record<string, unknown>;
+    return obj['strm_probed'] === true || obj['strm_probed'] === 1;
+  } catch {
+    return false;
+  }
+}
+
+export function markPartProbed(db: DatabaseSync, part: StrmPart): void {
+  // Set in SQL, not from part.extraData: the caller read that before a probe that
+  // can run for PROBE_TIMEOUT_MS, and writing it back would drop anything since.
+  db.prepare(
+    `UPDATE media_parts
+     SET extra_data = CASE
+           WHEN extra_data IS NULL OR extra_data = '' THEN json_object('strm_probed', json('true'))
+           WHEN json_valid(extra_data) THEN json_set(extra_data, '$.strm_probed', json('true'))
+           ELSE json_object('_raw', extra_data, 'strm_probed', json('true'))
+         END
+     WHERE id = ?`,
+  ).run(part.id);
 }
 
 function injectStrmSource(extraData: string | null, strmPath: string): string {

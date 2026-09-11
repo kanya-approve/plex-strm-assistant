@@ -27,7 +27,8 @@ export interface ParsedMedia {
   chromaSubsampling?: string;
   bitDepth?: number;
   frameRate?: string;
-  dovi?: DoviInfo;
+  // null: the stream was read and has no Dolby Vision. undefined: unknown.
+  dovi?: DoviInfo | null;
 
   audioChannelLayout?: string;
   samplingRate?: string;
@@ -82,15 +83,16 @@ export function parseMaExtraData(blob: string | null | undefined): Record<string
   return out;
 }
 
-// An undefined or empty addition leaves the stored key alone.
+// An undefined or empty addition leaves the stored key alone; null removes it.
 export function mergeMaExtraData(
   existing: string | null | undefined,
   additions: Record<string, string | number | undefined | null>,
 ): string {
   const merged = parseMaExtraData(existing);
   for (const [k, v] of Object.entries(additions)) {
-    if (v === undefined || v === null || v === '') continue;
-    merged[k] = String(v);
+    if (v === undefined || v === '') continue;
+    if (v === null) delete merged[k];
+    else merged[k] = String(v);
   }
   return buildMaExtraData(merged);
 }
@@ -101,7 +103,11 @@ export function maExtraDataContains(
 ): boolean {
   const base = parseMaExtraData(existing);
   for (const [k, v] of Object.entries(additions)) {
-    if (v === undefined || v === null || v === '') continue;
+    if (v === undefined || v === '') continue;
+    if (v === null) {
+      if (k in base) return false;
+      continue;
+    }
     if (base[k] !== String(v)) return false;
   }
   return true;
@@ -247,6 +253,17 @@ export function colorInfoFor(range: DynamicRange): ColorInfo {
     default:
       return { colorTrc: 'bt709', colorPrimaries: 'bt709', colorSpace: 'bt709', bitDepth: 8 };
   }
+}
+
+export function mergeParsed(base: ParsedMedia, override: ParsedMedia): ParsedMedia {
+  const out: ParsedMedia = { ...base };
+  for (const [k, v] of Object.entries(override) as [keyof ParsedMedia, unknown][]) {
+    if (v !== undefined && v !== null && v !== '') {
+      (out as Record<string, unknown>)[k] = v;
+    }
+  }
+  if ('dovi' in override) out.dovi = override.dovi;
+  return out;
 }
 
 export function normaliseLanguage(lang: string): string {

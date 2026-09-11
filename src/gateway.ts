@@ -14,7 +14,7 @@
  *     when the source is only reachable in-cluster, so an off-network client
  *     never has to reach it.
  *
- * The Plex database is opened read-only, so it is safe while Plex runs.
+ * DB lookups are read-only; the probe-on-play write uses a separate writable handle.
  */
 import crypto from 'crypto';
 import fs from 'fs';
@@ -24,8 +24,13 @@ import net from 'net';
 import tls from 'tls';
 import path from 'path';
 import { Readable } from 'node:stream';
+import type { DatabaseSync } from 'node:sqlite';
 import { normaliseStrmUrl, resolveRedirects, strmPathFromUrlPath } from './strm';
-import { trackedDb } from './db';
+import { findPartById, markPartProbed, trackedDb } from './db';
+import { parseMediaFilename } from './parse';
+import { probeMedia } from './probe';
+import { applyMediaMetadata } from './metadata';
+import { mergeParsed } from './plex-extra-data';
 
 const STRM_ROOT = path.resolve(process.env.STRM_ROOT ?? '/strm');
 const GATEWAY_PORT = Number(process.env.GATEWAY_PORT ?? 32500);
@@ -50,6 +55,7 @@ const PART_PATH_RE = /^\/library\/parts\/(\d+)\/\d+\/file(?:\.\w+)?$/;
 const DECISION_PATH = '/video/:/transcode/universal/decision';
 
 const readDb = trackedDb(DB_PATH, { readOnly: true });
+const writeDb = trackedDb(DB_PATH);
 
 /** Looks up the stored file column for a media part. Returns null on any failure. */
 function lookupPartFile(partId: string): string | null {
@@ -63,6 +69,18 @@ function lookupPartFile(partId: string): string | null {
   } catch (err) {
     console.warn(`db lookup failed: ${(err as Error).message}`);
     readDb.close(); // reopen on next request
+    return null;
+  }
+}
+
+const WRITE_METADATA = process.env.WRITE_METADATA === 'true';
+
+function metadataDb(): DatabaseSync | null {
+  if (!WRITE_METADATA) return null;
+  try {
+    return writeDb.get();
+  } catch (err) {
+    console.warn(`probe-on-play: cannot open db (${(err as Error).message})`);
     return null;
   }
 }
@@ -205,6 +223,49 @@ async function directUrlForPart(
   return FOLLOW_REDIRECTS ? resolveRedirects(url, userAgent) : url;
 }
 
+// Only real playback reaches the part handler: Plex's analyser fetches through the proxy.
+const probingParts = new Set<string>();
+async function enrichOnPlay(
+  partId: string,
+  sourceUrl: string,
+  userAgent: string | undefined,
+): Promise<void> {
+  if (!WRITE_METADATA || probingParts.has(partId)) return;
+  const wdb = metadataDb();
+  if (!wdb) return;
+
+  let part;
+  try {
+    part = findPartById(wdb, partId);
+  } catch (err) {
+    console.warn(`probe-on-play: part lookup failed for ${partId}: ${(err as Error).message}`);
+    return;
+  }
+  if (!part || part.probed) return;
+
+  const strmPath = strmPathForStored(part.file);
+  const filename = strmPath ? path.basename(strmPath) : path.basename(part.file);
+
+  probingParts.add(partId);
+  try {
+    const parsed = await parseMediaFilename(filename);
+    const probe = await probeMedia(sourceUrl, userAgent);
+    applyMediaMetadata(wdb, part, probe ? mergeParsed(parsed, probe) : parsed, false);
+    if (probe) {
+      try {
+        markPartProbed(wdb, part);
+      } catch {
+        // best-effort: re-marked on the next play
+      }
+    }
+    console.log(`probe  part ${partId}  metadata written${probe ? '' : ' (filename only)'}`);
+  } catch (err) {
+    console.warn(`probe-on-play failed for part ${partId}: ${(err as Error).message}`);
+  } finally {
+    probingParts.delete(partId);
+  }
+}
+
 const RELAY_HEADERS = [
   'content-type',
   'content-length',
@@ -336,6 +397,7 @@ const handleRequest = async (
       if (!VALIDATE_TOKEN || (await isValidToken(tokenFromRequest(req)))) {
         const target = await directUrlForPart(partMatch[1], req.headers['user-agent']);
         if (target) {
+          void enrichOnPlay(partMatch[1], target, req.headers['user-agent']);
           // Browsers can't follow a cross-origin 302 (CORS), so they get relayed too.
           if (DIRECT_STREAM || isBrowserRequest(req)) {
             console.log(`relay  part ${partMatch[1]}  ->  ${target}`);
@@ -421,7 +483,8 @@ const scheme = GATEWAY_TLS ? 'https' : 'http';
 server.listen(GATEWAY_PORT, () =>
   console.log(
     `strm-gateway on ${scheme}://:${GATEWAY_PORT}  ->  ${PLEX_UPSTREAM.href}  [${DIRECT_STREAM ? 'direct-stream' : 'direct-play'}]` +
-      (FOLLOW_REDIRECTS ? '  (following upstream redirects)' : ''),
+      (FOLLOW_REDIRECTS ? '  (following upstream redirects)' : '') +
+      (WRITE_METADATA ? '  (probe-on-play metadata)' : ''),
   ),
 );
 
@@ -429,6 +492,7 @@ for (const sig of ['SIGTERM', 'SIGINT'] as const) {
   process.on(sig, () => {
     server.close(() => {
       readDb.close();
+      writeDb.close();
       process.exit(0);
     });
   });

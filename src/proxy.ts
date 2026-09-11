@@ -52,7 +52,7 @@ async function enrich(urlPath: string, filePath: string): Promise<void> {
     }
 
     const part = findPartByProxyPath(activeDb, PROXY_BASE, CONTAINER_PREFIX, decodedPath);
-    if (!part) return;
+    if (!part || part.probed) return;
 
     const parsed = await parseMediaFilename(path.basename(filePath));
     applyMediaMetadata(activeDb, part, parsed, false);

@@ -1,6 +1,6 @@
 import type { DatabaseSync } from 'node:sqlite';
 import type { StrmPart } from './db';
-import { ParsedMedia, maExtraDataContains, mergeMaExtraData } from './plex-extra-data';
+import { DoviInfo, ParsedMedia, maExtraDataContains, mergeMaExtraData } from './plex-extra-data';
 
 const VIDEO = 1;
 const AUDIO = 2;
@@ -93,18 +93,33 @@ function videoExtraData(p: ParsedMedia): MaPairs {
     'ma:height': p.height,
     'ma:profile': p.videoProfile,
     'ma:width': p.width,
-    ...(p.dovi
-      ? {
-          'ma:DOVIBLCompatID': p.dovi.blCompatId,
-          'ma:DOVIBLPresent': p.dovi.blPresent,
-          'ma:DOVIELPresent': p.dovi.elPresent,
-          'ma:DOVILevel': p.dovi.level,
-          'ma:DOVIPresent': '1',
-          'ma:DOVIProfile': p.dovi.profile,
-          'ma:DOVIRPUPresent': p.dovi.rpuPresent,
-          'ma:DOVIVersion': p.dovi.version,
-        }
-      : {}),
+    ...doviExtraData(p.dovi),
+  };
+}
+
+const DOVI_KEYS = [
+  'ma:DOVIBLCompatID',
+  'ma:DOVIBLPresent',
+  'ma:DOVIELPresent',
+  'ma:DOVILevel',
+  'ma:DOVIPresent',
+  'ma:DOVIProfile',
+  'ma:DOVIRPUPresent',
+  'ma:DOVIVersion',
+];
+
+function doviExtraData(dovi: DoviInfo | null | undefined): MaPairs {
+  if (dovi === undefined) return {};
+  if (dovi === null) return Object.fromEntries(DOVI_KEYS.map((k) => [k, null]));
+  return {
+    'ma:DOVIBLCompatID': dovi.blCompatId,
+    'ma:DOVIBLPresent': dovi.blPresent,
+    'ma:DOVIELPresent': dovi.elPresent,
+    'ma:DOVILevel': dovi.level,
+    'ma:DOVIPresent': '1',
+    'ma:DOVIProfile': dovi.profile,
+    'ma:DOVIRPUPresent': dovi.rpuPresent,
+    'ma:DOVIVersion': dovi.version,
   };
 }
 
@@ -116,7 +131,7 @@ function audioExtraData(p: ParsedMedia): MaPairs {
 }
 
 function hasAny(pairs: MaPairs): boolean {
-  return Object.values(pairs).some((v) => v !== undefined && v !== null && v !== '');
+  return Object.values(pairs).some((v) => v !== undefined && v !== '');
 }
 
 function hasWork(plan: WritePlan): boolean {
