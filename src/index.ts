@@ -111,7 +111,7 @@ let metaUpdated = 0;
 async function run(): Promise<void> {
   for (const localPath of strmFiles) {
     const containerPath = toContainerPath(localPath, opts.rebase);
-    const realUrl = readStrmUrl(localPath);
+    const realUrl = await readStrmUrl(localPath);
 
     if (!realUrl) {
       console.warn(`  SKIP  ${localPath}\n        (empty or non-HTTP content)`);
