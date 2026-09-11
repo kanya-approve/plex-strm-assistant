@@ -157,6 +157,11 @@ async function run(): Promise<void> {
 
     if (!opts.writeMetadata) continue;
 
+    if (part.probed) {
+      console.log('    meta: skipped (already probed at play time)');
+      continue;
+    }
+
     try {
       const parsed = await parseMediaFilename(path.basename(containerPath));
       if (applyMediaMetadata(db, part, parsed, opts.dryRun ?? false)) {

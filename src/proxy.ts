@@ -40,6 +40,7 @@ if (!WRITE_METADATA) {
 }
 
 // Filename-only, no network: this runs on every fetch, Plex scans included.
+// Skip items the gateway already probed so we don't overwrite accurate data.
 async function enrich(urlPath: string, filePath: string): Promise<void> {
   const activeDb = currentDb();
   if (!activeDb) return;
@@ -52,7 +53,7 @@ async function enrich(urlPath: string, filePath: string): Promise<void> {
     }
 
     const part = findPartByProxyPath(activeDb, PROXY_BASE, CONTAINER_PREFIX, decodedPath);
-    if (!part) return;
+    if (!part || part.probed) return;
 
     const parsed = await parseMediaFilename(path.basename(filePath));
     applyMediaMetadata(activeDb, part, parsed, false);
