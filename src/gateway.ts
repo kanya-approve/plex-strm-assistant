@@ -279,3 +279,12 @@ server.listen(GATEWAY_PORT, () =>
       (FOLLOW_REDIRECTS ? '  (following upstream redirects)' : ''),
   ),
 );
+
+for (const sig of ['SIGTERM', 'SIGINT'] as const) {
+  process.on(sig, () => {
+    server.close(() => {
+      readDb.close();
+      process.exit(0);
+    });
+  });
+}
