@@ -1,4 +1,5 @@
 import { DatabaseSync } from 'node:sqlite';
+import fs from 'fs';
 import path from 'path';
 import os from 'os';
 
@@ -21,9 +22,49 @@ const DEFAULT_DB_PATH = path.join(
   'Library/Application Support/Plex/Plex Media Server/Plug-in Support/Databases/com.plexapp.plugins.library.db',
 );
 
-export function openDb(dbPath = DEFAULT_DB_PATH): DatabaseSync {
+export function openDb(dbPath = DEFAULT_DB_PATH, { readOnly = false } = {}): DatabaseSync {
   // timeout: wait up to 5 s if Plex holds a brief write lock (DB is in WAL mode so reads never block us)
-  return new DatabaseSync(dbPath, { timeout: 5000 });
+  return new DatabaseSync(dbPath, { readOnly, timeout: 5000 });
+}
+
+export interface TrackedDb {
+  get(): DatabaseSync | null;
+  close(): void;
+}
+
+/** Reopens on inode change: Plex's "Optimize database" swaps in a new file, and a
+ *  handle held across the swap keeps using the orphaned one. */
+export function trackedDb(dbPath: string, options: { readOnly?: boolean } = {}): TrackedDb {
+  let handle: DatabaseSync | null = null;
+  let ino = 0;
+
+  function close(): void {
+    try {
+      handle?.close();
+    } catch {
+      // already gone
+    }
+    handle = null;
+    ino = 0;
+  }
+
+  return {
+    get() {
+      let current: number;
+      try {
+        current = fs.statSync(dbPath).ino;
+      } catch {
+        close();
+        return null;
+      }
+      if (handle && current === ino) return handle;
+      close();
+      handle = openDb(dbPath, options);
+      ino = current;
+      return handle;
+    },
+    close,
+  };
 }
 
 /**
