@@ -16,8 +16,8 @@ import fs from 'fs';
 import http from 'http';
 import net from 'net';
 import path from 'path';
-import { DatabaseSync } from 'node:sqlite';
 import { normaliseStrmUrl, resolveRedirects, strmPathFromUrlPath } from './strm';
+import { trackedDb } from './db';
 
 const STRM_ROOT = path.resolve(process.env.STRM_ROOT ?? '/strm');
 const GATEWAY_PORT = Number(process.env.GATEWAY_PORT ?? 32500);
@@ -34,19 +34,20 @@ const PART_PATH_RE = /^\/library\/parts\/(\d+)\/\d+\/file(?:\.\w+)?$/;
 // items the query is rewritten to force direct play before reaching PMS.
 const DECISION_PATH = '/video/:/transcode/universal/decision';
 
-let db: DatabaseSync | null = null;
+const readDb = trackedDb(DB_PATH, { readOnly: true });
 
 /** Looks up the stored file column for a media part. Returns null on any failure. */
 function lookupPartFile(partId: string): string | null {
   try {
-    db ??= new DatabaseSync(DB_PATH, { readOnly: true, timeout: 5000 });
+    const db = readDb.get();
+    if (!db) return null;
     const row = db.prepare('SELECT file FROM media_parts WHERE id = ?').get(partId) as
       | { file: string }
       | undefined;
     return row?.file ?? null;
   } catch (err) {
     console.warn(`db lookup failed: ${(err as Error).message}`);
-    db = null; // reopen on next request; the DB may not exist yet on first run
+    readDb.close(); // reopen on next request
     return null;
   }
 }
@@ -110,7 +111,8 @@ function strmPathForStored(stored: string): string | null {
 /** True when any media part of the metadata item resolves to a .strm file. */
 function metadataHasStrmPart(metadataId: string): boolean {
   try {
-    db ??= new DatabaseSync(DB_PATH, { readOnly: true, timeout: 5000 });
+    const db = readDb.get();
+    if (!db) return false;
     const rows = db
       .prepare(
         `SELECT mp.file FROM media_parts mp
@@ -121,7 +123,7 @@ function metadataHasStrmPart(metadataId: string): boolean {
     return rows.some((row) => row.file != null && strmPathForStored(row.file) !== null);
   } catch (err) {
     console.warn(`db lookup failed: ${(err as Error).message}`);
-    db = null;
+    readDb.close();
     return false;
   }
 }
